@@ -8,10 +8,11 @@
 //! jmp rax                          ; FF E0
 //! ```
 //!
-//! The jump keeps the title's return address on the stack, so the handler
+//! The jump leaves RSP and the caller's shadow space intact, so the handler
 //! returns straight to the caller. Bring-up then shows exactly which API to
 //! implement next, rather than failing at load time.
 
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
@@ -19,7 +20,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     DebugBreak, FlushInstructionCache, IsDebuggerPresent,
 };
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc,
+    VirtualFree, VirtualProtect,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -90,12 +92,14 @@ pub(crate) struct ThunkBlock {
 impl ThunkBlock {
     /// Reserves room for `count` stubs (writable until [`Self::seal`]).
     pub(crate) fn new(count: usize) -> Result<Self> {
-        let len = (count.max(1) * THUNK_SIZE).next_multiple_of(4096);
+        let len = count
+            .checked_mul(THUNK_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("import stub block size overflow"))?;
         // SAFETY: fresh anonymous allocation; no existing memory is touched.
         let base = unsafe {
             VirtualAlloc(
                 std::ptr::null(),
-                len,
+                len.max(1), // VirtualAlloc rounds up to whole pages.
                 MEM_COMMIT | MEM_RESERVE,
                 PAGE_READWRITE,
             )
@@ -111,7 +115,7 @@ impl ThunkBlock {
 
     /// Emits a stub for `site` and returns its address.
     pub(crate) fn emit(&mut self, site: &'static ImportSite) -> Result<usize> {
-        if self.used + THUNK_SIZE > self.len {
+        if self.used == self.len {
             bail!("import stub block is full");
         }
         let mut code = [0xCC_u8; THUNK_SIZE]; // int3 padding
@@ -134,6 +138,16 @@ impl ThunkBlock {
     /// Makes the block read+execute. The block is intentionally leaked:
     /// title code may hold these addresses for the life of the process.
     pub(crate) fn seal(self) -> Result<()> {
+        self.seal_with_cache_flush(|base, len| {
+            // SAFETY: flushing our own process's cache for the block being sealed.
+            unsafe { FlushInstructionCache(GetCurrentProcess(), base, len) }
+        })
+    }
+
+    fn seal_with_cache_flush(self, flush: impl FnOnce(*const c_void, usize) -> i32) -> Result<()> {
+        if self.used == 0 {
+            return Ok(());
+        }
         let mut old = 0;
         // SAFETY: `base..base+len` is the allocation made in `new`.
         let ok = unsafe { VirtualProtect(self.base as _, self.len, PAGE_EXECUTE_READ, &mut old) };
@@ -143,15 +157,161 @@ impl ThunkBlock {
                 std::io::Error::last_os_error()
             );
         }
-        // SAFETY: flushing our own process's instruction cache for our own block.
-        unsafe { FlushInstructionCache(GetCurrentProcess(), self.base as _, self.len) };
+        if flush(self.base.cast(), self.len) == 0 {
+            bail!(
+                "FlushInstructionCache for import stubs failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // Only successfully sealed stubs can be published to the title.
+        std::mem::forget(self);
         Ok(())
+    }
+}
+
+impl Drop for ThunkBlock {
+    fn drop(&mut self) {
+        // SAFETY: this is the reservation base. MEM_RELEASE requires size zero.
+        unsafe { VirtualFree(self.base.cast(), 0, MEM_RELEASE) };
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_DECOMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+
+    static SITE: ImportSite = ImportSite {
+        dll: String::new(),
+        symbol: String::new(),
+        policy: UnimplementedPolicy::ReturnZero,
+        calls: AtomicU64::new(0),
+    };
+
+    fn memory_info(base: *const u8) -> MEMORY_BASIC_INFORMATION {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        let size = size_of_val(&info);
+        // SAFETY: VirtualQuery inspects the address without dereferencing it.
+        assert_eq!(unsafe { VirtualQuery(base.cast(), &mut info, size) }, size);
+        info
+    }
+
+    #[test]
+    fn capacity_matches_the_requested_slot_count() {
+        for count in [0, 1, 128, 129] {
+            let mut block = ThunkBlock::new(count).unwrap();
+            for slot in 0..count {
+                // Repeated imports still occupy distinct, aligned slots.
+                let at = block.emit(&SITE).unwrap();
+                assert_eq!(at, block.base as usize + slot * THUNK_SIZE);
+                assert_eq!(at % THUNK_SIZE, 0);
+            }
+            assert_eq!(
+                block.emit(&SITE).unwrap_err().to_string(),
+                "import stub block is full"
+            );
+        }
+    }
+
+    #[test]
+    fn overflowing_slot_counts_fail_before_allocation() {
+        for count in [usize::MAX / THUNK_SIZE + 1, usize::MAX] {
+            let err = ThunkBlock::new(count).err().expect("size overflow");
+            assert_eq!(err.to_string(), "import stub block size overflow");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn encoded_stub_preserves_both_addresses_and_returns_to_its_caller() {
+        let mut block = ThunkBlock::new(1).unwrap();
+        let at = block.emit(&SITE).unwrap();
+        assert_eq!(memory_info(block.base).Protect, PAGE_READWRITE);
+        // SAFETY: emit initialized all 32 bytes of this committed slot.
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, THUNK_SIZE) };
+        assert_eq!(&bytes[..2], &[0x48, 0xB9]);
+        assert_eq!(
+            u64::from_le_bytes(bytes[2..10].try_into().unwrap()),
+            &SITE as *const _ as u64
+        );
+        assert_eq!(&bytes[10..12], &[0x48, 0xB8]);
+        assert_eq!(
+            u64::from_le_bytes(bytes[12..20].try_into().unwrap()),
+            unimplemented_import as *const () as u64
+        );
+        assert_eq!(&bytes[20..22], &[0xFF, 0xE0]);
+        assert_eq!(&bytes[22..], &[0xCC; 10]);
+
+        block.seal().unwrap();
+        assert_eq!(memory_info(at as *const u8).Protect, PAGE_EXECUTE_READ);
+        // SAFETY: the sealed x64 stub supplies its own RCX argument and tail
+        // jumps to the system-ABI handler, which returns a u64.
+        let result = unsafe {
+            let stub: unsafe extern "system" fn() -> u64 = std::mem::transmute(at);
+            stub()
+        };
+        assert_eq!(result, 0);
+        assert_eq!(SITE.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unpublished_blocks_release_the_reservation() {
+        // Isolate address-reuse checks from allocations by parallel tests.
+        const CHILD: &str = "VICTORY_THUNK_RELEASE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "thunks::tests::unpublished_blocks_release_the_reservation",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let block = ThunkBlock::new(1).unwrap();
+        let base = block.base;
+        drop(block);
+        assert_eq!(memory_info(base).State, MEM_FREE);
+
+        let block = ThunkBlock::new(0).unwrap();
+        let base = block.base;
+        block.seal().unwrap();
+        assert_eq!(memory_info(base).State, MEM_FREE);
+
+        let mut block = ThunkBlock::new(1).unwrap();
+        block.emit(&SITE).unwrap();
+        let base = block.base;
+        // SAFETY: decommit our own page but keep its reservation. Protecting
+        // it must now fail, and Drop can still release the reservation.
+        let decommitted = unsafe { VirtualFree(base.cast(), block.len, MEM_DECOMMIT) };
+        assert_ne!(decommitted, 0);
+        let err = block.seal().unwrap_err();
+        assert_eq!(memory_info(base).State, MEM_FREE);
+        assert!(err.to_string().contains("VirtualProtect"));
+
+        let mut block = ThunkBlock::new(1).unwrap();
+        block.emit(&SITE).unwrap();
+        let base = block.base;
+        let err = block
+            .seal_with_cache_flush(|_, _| {
+                // SAFETY: sets only this thread's last-error code.
+                unsafe { windows_sys::Win32::Foundation::SetLastError(5) };
+                0
+            })
+            .unwrap_err();
+        assert_eq!(memory_info(base).State, MEM_FREE);
+        assert!(err.to_string().contains("FlushInstructionCache"));
+    }
 
     /// In a child process of the next test: calls an unimplemented import
     /// that traps, with the crash log where `VICTORY_TRAP_LOG` says.

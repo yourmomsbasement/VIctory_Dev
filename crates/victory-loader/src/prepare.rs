@@ -139,7 +139,8 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        // Entries are 16-bit words, and each must fit inside this block.
+        if block < 8 || !block.is_multiple_of(2) || at + block > end {
             break;
         }
         for entry in (at + 8..at + block).step_by(2) {
@@ -271,6 +272,27 @@ mod tests {
             assigned, 0,
             "the process executable already owns TLS slot zero"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ignores_an_incomplete_relocation_entry() {
+        let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let info = ImageInfo::parse(&original).unwrap();
+        let directory = layout::data_directory_offset(&original, dir::BASERELOC).unwrap();
+        let rva = layout::read_u32(&original, directory).unwrap();
+        let block = info.rva_to_file_offset(rva).unwrap() as usize;
+        write_u32(&mut original, block, 0).unwrap();
+        write_u32(&mut original, block + 4, 12).unwrap();
+        write_u32(&mut original, directory + 4, 12).unwrap();
+        write_u16(&mut original, block + 8, 10 << 12).unwrap();
+        write_u16(&mut original, block + 10, 0).unwrap();
+        assert_eq!(dir64_relocations(&original, &info), [(block + 8, 0)]);
+
+        // Only the first byte of the entry belongs to the shortened block.
+        write_u32(&mut original, block + 4, 9).unwrap();
+        write_u32(&mut original, directory + 4, 9).unwrap();
+        assert!(dir64_relocations(&original, &info).is_empty());
     }
 
     #[test]

@@ -102,6 +102,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn header_offsets_follow_the_dos_header_pointer() {
+        let mut data = [0u8; 0x100];
+        data[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
+
+        assert_eq!(file_header_offset(&data), Some(0x44));
+        assert_eq!(optional_header_offset(&data), Some(0x58));
+    }
+
+    #[test]
+    fn data_directory_offsets_respect_declared_entry_count() {
+        let mut data = vec![0u8; 0x200];
+        data[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
+
+        let optional = 0x58;
+        let file_header = file_header_offset(&data).unwrap();
+        let size_of_optional_header_field = file_header + 16;
+        let size_of_optional_header = OPT_DATA_DIRECTORY + 2 * DATA_DIRECTORY_SIZE;
+        data[size_of_optional_header_field..size_of_optional_header_field + 2]
+            .copy_from_slice(&(size_of_optional_header as u16).to_le_bytes());
+
+        let count_at = optional + OPT_NUMBER_OF_RVA_AND_SIZES;
+        data[count_at..count_at + 4].copy_from_slice(&2u32.to_le_bytes());
+
+        let first = optional + OPT_DATA_DIRECTORY;
+        assert_eq!(data_directory_offset(&data, 0), Some(first));
+        assert_eq!(
+            data_directory_offset(&data, 1),
+            Some(first + DATA_DIRECTORY_SIZE)
+        );
+        assert_eq!(data_directory_offset(&data, 2), None);
+    }
+
+    #[test]
+    fn header_offset_helpers_reject_truncated_headers() {
+        let truncated_dos = [0u8; DOS_E_LFANEW + 3];
+        assert_eq!(file_header_offset(&truncated_dos), None);
+        assert_eq!(optional_header_offset(&truncated_dos), None);
+
+        let mut truncated_optional = [0u8; 0x100];
+        truncated_optional[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
+
+        assert_eq!(data_directory_offset(&truncated_optional, 0), None);
+    }
+
+    #[test]
     fn reads_reject_overflowing_offsets() {
         let data = [0u8; 16];
         assert_eq!(read_u32(&data, usize::MAX - 1), None);
