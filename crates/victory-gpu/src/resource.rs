@@ -237,6 +237,97 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The 32-bit format that stands in for [`NARROW`] formats the host cannot
+/// render to or store to as unordered access (B8G8R8A8_UNORM: the same
+/// channels, wider).
+pub(crate) const WIDE: u32 = 87;
+
+/// 16-bit packed color formats (B5G6R5, B5G5R5A1, B4G4R4A4) whose render
+/// target and typed unordered-access support is optional: NVIDIA refuses
+/// B4G4R4A4 targets and B5G5R5A1 typed stores, which the console (and AMD)
+/// allow.
+const NARROW: [u32; 3] = [85, 86, 115];
+
+/// Whether render-target and unordered-access textures of `format` get a
+/// [`WIDE`] host copy, which their views, target views and pipelines then
+/// name: the host lacks render-target or typed unordered-access store
+/// support for it. Decided per format once (pipelines name the format
+/// without the texture).
+/// shortcut: blending and stores keep 8 bits per channel where the console
+/// rounds to 4 or 5; copies between a widened texture and a native one of
+/// the same title format are skipped.
+#[cfg(windows)]
+pub(crate) fn widened(format: u32) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static DECIDED: std::sync::OnceLock<[bool; NARROW.len()]> = std::sync::OnceLock::new();
+    let Some(i) = NARROW.iter().position(|&f| f == format) else {
+        return false;
+    };
+    if let Some(decided) = DECIDED.get() {
+        return decided[i];
+    }
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    DECIDED.get_or_init(|| {
+        NARROW.map(|f| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(f as i32),
+                ..Default::default()
+            };
+            // SAFETY: a plain query into a structure of its size.
+            let asked = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            let target = support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0;
+            let store = support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0
+                != 0
+                && support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
+            let wide = asked.is_err() || !target || !store;
+            if wide {
+                tracing::info!(
+                    format = f,
+                    target,
+                    store,
+                    "render targets and unordered access of this format get 32-bit host copies"
+                );
+            }
+            wide
+        })
+    })[i]
+}
+
+#[cfg(not(windows))]
+pub(crate) fn widened(_: u32) -> bool {
+    false
+}
+
+/// The format a host target view or pipeline names for title format
+/// `format` (as the host has it): [`WIDE`] where [`widened`].
+pub(crate) fn target_format(format: u32) -> u32 {
+    if widened(format) { WIDE } else { format }
+}
+
+/// Whether `this`'s host copy is a [`WIDE`] stand-in for its title format.
+#[cfg(windows)]
+pub(crate) fn is_widened(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    let Some(host) = r.host.as_ref() else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let host_format = unsafe { host.texture.GetDesc() }.Format.0 as u32;
+    host_format == WIDE && NARROW.contains(&r.desc.format)
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -823,6 +914,10 @@ fn host_texture(
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    if d.flags & (RENDER_TARGET | UNORDERED) != 0 && widened(d.format) {
+        d.format = WIDE;
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -840,6 +935,9 @@ fn host_texture(
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
+        if d.format == WIDE {
+            value[0] = target_format(value[0]);
+        }
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {

@@ -446,6 +446,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::resource::is_widened(dst) != crate::resource::is_widened(src) {
+                widened_copy_skipped();
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -465,6 +469,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+/// A copy between a widened host copy and a native one was left out.
+#[cfg(windows)]
+fn widened_copy_skipped() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!("copy between a widened 16-bit texture and a native one skipped")
+    });
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -511,6 +524,14 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        // A widened host copy (see `resource::widened`) has another format
+        // than the title's footprints and native copies: the host refuses
+        // copies between them.
+        let src_widened = src.kind != FOOTPRINT && crate::resource::is_widened(src.resource);
+        if crate::resource::is_widened(dst.resource) != src_widened {
+            widened_copy_skipped();
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]

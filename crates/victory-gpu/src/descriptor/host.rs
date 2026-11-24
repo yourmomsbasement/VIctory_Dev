@@ -131,17 +131,37 @@ impl HostHeap {
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC, count + MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+                    // The largest heap the host takes: tier 3 hardware may
+                    // take more than the portable limit, short of the
+                    // title's whole heap.
+                    let (mut low, mut high) = (PORTABLE_VIEWS, count + MIN_DYNAMIC - 1);
+                    let mut best = None;
+                    while low <= high {
+                        let mid = low + (high - low) / 2;
+                        match make(mid) {
+                            Ok(heap) => {
+                                best = Some((heap, mid));
+                                low = mid + 1;
+                            }
+                            Err(_) => high = mid - 1,
+                        }
+                    }
+                    let (heap, size) = match best {
+                        Some(b) => b,
+                        None => (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS),
+                    };
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping. A
                     // shader's index past the heap reads its last slot,
                     // which no view takes (translated shaders clamp to it).
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (
-                        make(PORTABLE_VIEWS).ok()?,
-                        PORTABLE_VIEWS - MIN_DYNAMIC,
-                        MIN_DYNAMIC - 1,
-                        PORTABLE_VIEWS,
-                    )
+                    tracing::warn!(
+                        error = %e,
+                        count,
+                        host_limit = size,
+                        left_out = count - (size - MIN_DYNAMIC),
+                        "host view heap capped"
+                    );
+                    (heap, size - MIN_DYNAMIC, MIN_DYNAMIC - 1, size)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -667,6 +687,13 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
             "view the host does not allow"
         );
         return false;
+    }
+    // A widened host copy (see `widened`) is viewed in its own format.
+    if own == crate::resource::WIDE
+        && let Some(format) = format.as_deref_mut()
+        && crate::resource::target_format(format.0 as u32) == own
+    {
+        format.0 = own as i32;
     }
     // Every family has more than one format, its typeless one first.
     let typeless = family(own) == own && family(own + 1) == own;
