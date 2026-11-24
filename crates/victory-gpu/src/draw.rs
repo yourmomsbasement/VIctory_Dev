@@ -550,6 +550,41 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
+                #[cfg(all(windows, feature = "diagnostics"))]
+                if let Some(hash) = crate::pipeline::traced_shader(self.pipeline as This) {
+                    // Diagnostics: where the tables of a traced shader land in
+                    // the host heap (a table entry at or past the host's
+                    // count reads a null slot on a capped heap).
+                    static SEEN: std::sync::Mutex<Vec<(String, u8, u32)>> = std::sync::Mutex::new(Vec::new());
+                    for u in t.host.user_data.iter().filter(|u| u.root == RootType::Table) {
+                        let value = values[u.index as usize];
+                        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                        if seen.len() >= 256 || seen.iter().any(|s| *s == (hash.clone(), u.slot, value)) {
+                            continue;
+                        }
+                        seen.push((hash.clone(), u.slot, value));
+                        let rebuilt = made.iter().any(|m| m.0 == u.slot);
+                        let (title_start, count) = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                            Some(&Root::Table(table)) => self
+                                .heap_of(table)
+                                .map(|heap| (heap.index(table), heap.host().map(|h| h.count())))
+                                .unwrap_or((None, None)),
+                            _ => (None, None),
+                        };
+                        tracing::warn!(
+                            shader = %hash,
+                            root_slot = u.slot,
+                            user_dword = u.index,
+                            value = format_args!("{value:#x}"),
+                            first_slot = value >> 5,
+                            entry_48_slot = (value >> 5) + 48,
+                            rebuilt,
+                            ?title_start,
+                            ?count,
+                            "traced table"
+                        );
+                    }
+                }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
