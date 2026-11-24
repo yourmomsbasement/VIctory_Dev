@@ -369,6 +369,34 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     Some(out[0][0])
 }
 
+#[test]
+fn lane_permutations_obey_rows_selectors_and_inactive_sources() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (opcode, control, cases) in [
+        (0x377, 0, [(32, 8, 15), (32, 17, 16), (10, 8, 42)]),
+        (0x378, 0, [(32, 8, 31), (32, 17, 0), (16, 1, 42)]),
+        (0x378, 2, [(32, 8, 31), (32, 17, 0), (16, 1, 0)]),
+    ] {
+        let words = [
+            0x7E0A_02AA, // v_mov_b32 v5, 42
+            0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+            0xBE8D_3C6A, // s_and_saveexec_b32 s13, vcc_lo
+            0xD400_0005 | opcode << 16 | control << 11,
+            256 | 128 << 9 | 193 << 18, // v5 <- permute v0, 0, -1
+            0xBEFE_030D, // s_mov_b32 exec_lo, s13
+            0x7DA4_0001, // v_cmpx_eq_u32 exec_lo, s1, v0
+            0xE070_0000, 0x8002_0500, // buffer_store_dword v5, off, s[8:11], 0
+        ];
+        let native = native_of(&words, false, 32);
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let shader = lowered(&native, &p, &HashSet::new()).unwrap();
+        for (active, lane, expected) in cases {
+            let Some(value) = on_the_card(&shader, [active, lane]) else { return };
+            assert_eq!(value, expected, "opcode {opcode:#x}, control {control}, lane {lane}");
+        }
+    }
+}
+
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack
