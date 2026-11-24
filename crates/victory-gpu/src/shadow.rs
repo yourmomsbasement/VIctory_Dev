@@ -2414,6 +2414,12 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        // A page only partly in the range would stay stale for the rest and
+        // be copied again by every later range in it (directly indexed SRVs
+        // ask for many small ranges per page, each submission). Where no
+        // shader of a submission may be writing the rest of an edge page,
+        // the range takes in the whole page, within the buffer.
+        let (from, to) = self.whole_edge_pages(from, to);
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -2445,6 +2451,23 @@ impl Shadow {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
         bytes
+    }
+
+    /// `[from, to)` widened to its first and last pages' bounds (cut to the
+    /// buffer), each edge only where no pending range lies in what it adds.
+    fn whole_edge_pages(&self, from: usize, to: usize) -> (usize, usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let lo = (from / PAGE * PAGE).max(start);
+        let hi = (to.div_ceil(PAGE) * PAGE).min(end);
+        if lo == from && hi == to {
+            return (from, to);
+        }
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let free = |a: usize, e: usize| a >= e || pending.iter().all(|&(p, q)| q <= a || p >= e);
+        (
+            if free(lo, from) { lo } else { from },
+            if free(to, hi) { hi } else { to },
+        )
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
@@ -3183,4 +3206,90 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    /// A write-watched title allocation of two pages, registered as a
+    /// buffer, with its copy.
+    struct Watched {
+        base: usize,
+        shadow: Arc<Shadow>,
+    }
+
+    impl Watched {
+        fn new() -> Option<Watched> {
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            crate::host::host()?;
+            // SAFETY: a new committed, write-watched allocation the test owns.
+            let at = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    2 * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!at.is_null());
+            let base = at as usize;
+            register(base, base as u64, 2 * PAGE as u64);
+            let shadow = find(base as u64, 2 * PAGE as u64).unwrap();
+            Some(Watched { base, shadow })
+        }
+    }
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            unregister(self.base, self.base as u64);
+            // SAFETY: allocated with VirtualAlloc in `new`.
+            unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// Small ranges in one page (as directly indexed SRVs ask for them): the
+    /// first copies the page, the others nothing until the title writes it.
+    #[test]
+    fn small_ranges_in_one_page_copy_it_once() {
+        let Some(t) = Watched::new() else {
+            return;
+        };
+        let page = t.base + PAGE;
+        // SAFETY: inside the test's allocation.
+        unsafe { (page as *mut u32).write(1) };
+        assert_eq!(t.shadow.update(page + 16, 16), PAGE);
+        for offset in (256..PAGE).step_by(4096) {
+            assert_eq!(t.shadow.update(page + offset, 16), 0);
+        }
+        // SAFETY: inside the test's allocation.
+        unsafe { ((page + 8192) as *mut u32).write(500) };
+        assert_eq!(t.shadow.update(page + 16, 16), PAGE);
+        // SAFETY: the copy's mapping covers the allocation.
+        let copied = unsafe { t.shadow.data.add(PAGE + 8192).cast::<u32>().read() };
+        assert_eq!(copied, 500);
+    }
+
+    /// Where shaders of a submission may be writing the rest of the page,
+    /// the range is copied as asked and the copy there is left alone.
+    #[test]
+    fn edge_pages_stay_cut_next_to_pending_writes() {
+        let Some(t) = Watched::new() else {
+            return;
+        };
+        let page = t.base + PAGE;
+        t.shadow.writing(page + 1024, 64);
+        // SAFETY: inside the copy's mapping and the test's allocation.
+        unsafe {
+            t.shadow.data.add(PAGE + 1024).cast::<u32>().write(7);
+            ((page + 1024) as *mut u32).write(13);
+        }
+        assert_eq!(t.shadow.update(page + 16, 16), 32);
+        // SAFETY: inside the copy's mapping.
+        let kept = unsafe { t.shadow.data.add(PAGE + 1024).cast::<u32>().read() };
+        assert_eq!(kept, 7);
+    }
 }
