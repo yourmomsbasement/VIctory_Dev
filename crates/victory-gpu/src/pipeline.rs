@@ -275,6 +275,24 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
+/// Diagnostics: the hash of a shader of `this` listed in
+/// `VICTORY_DUMP_SHADER_HASHES`, whose draws log their table offsets.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn traced_shader(this: This) -> Option<String> {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        parse_skip_hashes(&std::env::var("VICTORY_DUMP_SHADER_HASHES").unwrap_or_default())
+    });
+    if hashes.is_empty() || this.is_null() {
+        return None;
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .find(|shader| hashes.contains(&shader.hash))
+        .map(|shader| shader.hash.clone())
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
