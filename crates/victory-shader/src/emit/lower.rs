@@ -7170,6 +7170,11 @@ impl<'a> Lower<'a> {
         let Some(slot) = self.x.crumbs else { return };
         let next = self.crumb_loops.len() as u32;
         let n = *self.crumb_loops.entry(to).or_insert(next);
+        if n == next && std::env::var_os("VICTORY_CRUMB_MAP").is_some() {
+            // Diagnostics: which machine loop each breadcrumb word counts.
+            let at = self.x.p.blocks[to].insts.first().map_or(u32::MAX, |i| i.machine.offset as u32);
+            eprintln!("crumb map: slot {slot} loop {n}: header block {to} at {at:#06x}");
+        }
         if n >= super::BREADCRUMB_LOOPS {
             return;
         }

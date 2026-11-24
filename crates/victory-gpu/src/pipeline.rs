@@ -82,6 +82,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
+            #[cfg(all(windows, feature = "diagnostics"))]
+            dump_container(stage, &full.to_hex()[..16], bytes);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
@@ -91,6 +93,30 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
         })
         .clone()
+}
+
+/// Diagnostics: with `VICTORY_DUMP_SHADERS=<folder>` and
+/// `VICTORY_DUMP_SHADER_HASHES=<hash>,...` (16-digit hashes, as logged), the
+/// containers of those shaders are saved as `<stage>-<hash>.bin` in the
+/// folder when the title first passes them, for `victory shader-info
+/// --disasm`. They are the title's own bytes: keep them out of the repository.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_container(stage: &str, hash: &str, bytes: &[u8]) {
+    static WANTED: OnceLock<Option<(std::path::PathBuf, Vec<String>)>> = OnceLock::new();
+    let wanted = WANTED.get_or_init(|| {
+        let dir = std::env::var_os("VICTORY_DUMP_SHADERS")?;
+        let hashes = parse_skip_hashes(&std::env::var("VICTORY_DUMP_SHADER_HASHES").unwrap_or_default());
+        (!hashes.is_empty()).then(|| (std::path::PathBuf::from(dir), hashes))
+    });
+    let Some((dir, hashes)) = wanted else { return };
+    if !hashes.iter().any(|h| h == hash) {
+        return;
+    }
+    let path = dir.join(format!("{stage}-{hash}.bin"));
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, bytes)) {
+        Ok(()) => tracing::info!(path = %path.display(), "shader container dumped"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "shader container not dumped"),
+    }
 }
 
 /// A translated shader and the console resources its code reads.
