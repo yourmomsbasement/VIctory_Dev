@@ -280,6 +280,14 @@ impl RtvRecord {
             ]
         };
         words[0] = crate::resource::pc_format(words[0]);
+        #[cfg(windows)]
+        if let Some(host_tex) = crate::resource::host_resource(self.resource) {
+            // SAFETY: a live resource.
+            let own = unsafe { host_tex.GetDesc() }.Format.0 as u32;
+            if crate::resource::promoted_format(words[0], own) {
+                words[0] = own;
+            }
+        }
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }

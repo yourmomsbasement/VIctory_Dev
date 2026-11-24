@@ -53,6 +53,7 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    formats: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -239,6 +240,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            formats: Mutex::default(),
         })
     }
 }
@@ -431,6 +433,36 @@ struct Deferred {
 }
 
 impl Host {
+    /// Cached `(Support1, Support2)` flags for host DXGI format `format`.
+    pub(crate) fn format_support(&self, format: u32) -> (u32, u32) {
+        let mut formats = self.formats.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&pair) = formats.get(&format) {
+            return pair;
+        }
+        let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: `data` matches `D3D12_FEATURE_FORMAT_SUPPORT`.
+        let pair = unsafe {
+            if self
+                .device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut data).cast(),
+                    size_of_val(&data) as u32,
+                )
+                .is_ok()
+            {
+                (data.Support1.0 as u32, data.Support2.0 as u32)
+            } else {
+                (0, 0)
+            }
+        };
+        formats.insert(format, pair);
+        pair
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
