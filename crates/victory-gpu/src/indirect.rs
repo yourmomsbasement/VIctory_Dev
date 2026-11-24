@@ -4,8 +4,15 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler as a 5.1 shader; its root signature is built here,
-//! since Wine's compiler does not embed one).
+//! the system's compiler, a 5.1 shader; its root signature is made beside
+//! it).
+//!
+//! The source keeps to what Wine's compiler takes as well as Microsoft's:
+//! it has no methods on byte address buffers (`Load`, `Store`) and ignores
+//! a `RootSignature` attribute, and without the clamp every indirect
+//! execution is dropped. So the buffers are structured buffers of `uint`,
+//! which a root descriptor can be, and records are indexed in words: the
+//! caller already refuses addresses and strides that are not multiples of 4.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -39,6 +46,7 @@ static const uint GROUPS = 1u << 20;
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
+    // In words: the stride is a multiple of 4.
     uint at = id.x * (stride / 4);
     uint cost;
     if (kind <= 1) {
@@ -60,7 +68,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         args[at + 2] = g.z;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = uint3(min(args[at], 65535u), min(args[at + 1], 1u), min(args[at + 2], 1u));
+        uint3 g = uint3(args[at], args[at + 1], args[at + 2]);
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
         args[at] = g.x;
         args[at + 1] = g.y;
@@ -96,6 +105,72 @@ fn clamp() -> Option<&'static Clamp> {
             }
         })
         .as_ref()
+}
+
+/// The clamp's root signature: the record constants (b0), the arguments
+/// (u0) and the budget (u1) as root descriptors.
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let view = |register| D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let params = [
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 4,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        view(0),
+        view(1),
+    ];
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        },
+    };
+    // SAFETY: the description points at a live array; the blob is read in
+    // full before it is released.
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        let mut error: Option<ID3DBlob> = None;
+        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+            if let Some(error) = error {
+                let text = std::slice::from_raw_parts(
+                    error.GetBufferPointer().cast::<u8>(),
+                    error.GetBufferSize(),
+                );
+                tracing::warn!(
+                    "argument clamp root signature: {}",
+                    String::from_utf8_lossy(text)
+                );
+            }
+            return Err(e);
+        }
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
 }
 
 fn make() -> windows::core::Result<Clamp> {
@@ -251,6 +326,42 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clamp_preserves_record_offsets_and_shared_budget() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mut words = Box::new([[0x55aa_55aau32; 8]; 6]);
+        words[1][..2].copy_from_slice(&[16_777_223, 5]);
+        words[2][..3].copy_from_slice(&[3, 2, 1]);
+        words[3][..3].copy_from_slice(&[65_536, 17, 2]);
+        words[4][..3].copy_from_slice(&[70_000, 7, 2]);
+        words[5][..2].copy_from_slice(&[16_777_216, 4]);
+        let mut expected = *words;
+        expected[1][..2].copy_from_slice(&[16_777_216, 4]);
+        expected[3][..3].copy_from_slice(&[0, 0, 0]);
+        expected[4][..3].copy_from_slice(&[65_535, 1, 1]);
+        expected[5][..2].copy_from_slice(&[0, 4]);
+
+        let at = words.as_mut_ptr() as u64;
+        let len = std::mem::size_of_val(words.as_ref()) as u64;
+        crate::shadow::register(at as usize, at, len);
+        let shadow = crate::shadow::find(at, len).unwrap();
+        let list = host.new_list().expect("command list");
+        shadow.refresh(&list, at, len);
+        shadow.gpu_writes(&list, at, len);
+        for (kind, row, records) in [(0, 1, 1), (2, 2, 2), (10, 4, 1), (1, 5, 1)] {
+            let gpu = shadow.gpu(at + row * 32);
+            assert!(super::bound(&list, &shadow.buffer, gpu, (kind, 32, records)));
+            super::done(&list, &shadow.buffer);
+        }
+        list.close();
+        host.execute(&[&list]);
+        crate::shadow::unregister(at as usize, at);
+        assert_eq!(*words, expected);
+        eprintln!("all clamp output words and padding matched");
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
