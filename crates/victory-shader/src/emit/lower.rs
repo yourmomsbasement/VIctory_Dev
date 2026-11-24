@@ -3131,7 +3131,9 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
-        let Some((at, first)) = use_at else {
+        // A load read only for its numbers (sizes for a mip level, say):
+        // another load of the same entry, used as a resource, tells its kind.
+        let Some((at, first)) = use_at.or_else(|| self.same_entry_use(site)) else {
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -3236,6 +3238,49 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The use site and first dword of a resource descriptor loaded from
+    /// the same heap entry as the scalar load at `site`: the same parameter
+    /// and offset, and the same computed term (or the first lane's value of
+    /// the same VGPR, in another pass of a waterfall loop).
+    fn same_entry_use(&self, site: Site) -> Option<(Site, u8)> {
+        let a = self.scalar.get(&site)?;
+        let lane = |v: Value| -> Value {
+            self.x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+                .filter(|i| i.name() == "v_readfirstlane_b32")
+                .and_then(|i| i.reads.iter().find(|r| matches!(r.0, Reg::V(_))))
+                .map_or(v, |r| r.1)
+        };
+        let same = |b: &Address| {
+            b.param == a.param
+                && b.offset == a.offset
+                && match (a.dynamic, b.dynamic) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => x == y || lane(x) == lane(y),
+                    _ => false,
+                }
+        };
+        self.x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+            .find_map(|d| {
+                d.source.leaves().into_iter().find_map(|l| match *l {
+                    Source::Loaded { load, first }
+                        if load != site && self.scalar.get(&load).is_some_and(same) =>
+                    {
+                        Some((d.site, first))
+                    }
+                    _ => None,
+                })
+            })
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -7377,6 +7422,42 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn a_descriptor_read_only_as_data_takes_the_kind_of_its_entrys_use() {
+        // The table entry at s0 loaded twice: the second load's descriptor
+        // reads a structured buffer, the first's record count (dword 2) is
+        // only read as a number, as the console compiler does for a size.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_2000,
+            0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 idxen
+            0x7E04_020A, // v_mov_b32 v2, s10
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout, used).unwrap();
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
