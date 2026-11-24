@@ -11,15 +11,47 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, TranslateOptions, UserData, Wave64Mode};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+static WAVE64_MODE: AtomicU8 = AtomicU8::new(0);
+
+fn mode_byte(mode: Wave64Mode) -> u8 {
+    match mode {
+        Wave64Mode::Native => 0,
+        Wave64Mode::Wave32 => 1,
+        Wave64Mode::Emulate => 2,
+    }
+}
+
+/// Records the host device's preferred Wave64 compute lowering strategy.
+#[cfg(windows)]
+pub(crate) fn set_wave64_mode(mode: Wave64Mode) {
+    WAVE64_MODE.store(mode_byte(mode), Ordering::Relaxed);
+}
+
+fn effective_wave64_mode() -> Wave64Mode {
+    if let Ok(v) = std::env::var("VICTORY_WAVE64_EMULATE") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "native" => return Wave64Mode::Native,
+            "wave32" | "32" => return Wave64Mode::Wave32,
+            "1" | "emulate" | "force" => return Wave64Mode::Emulate,
+            "" | "auto" => {}
+            other => tracing::warn!(value = other, "unknown VICTORY_WAVE64_EMULATE; using auto"),
+        }
+    }
+    match WAVE64_MODE.load(Ordering::Relaxed) {
+        1 => Wave64Mode::Wave32,
+        2 => Wave64Mode::Emulate,
+        _ => Wave64Mode::Native,
+    }
+}
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -85,15 +117,18 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let wave64 = effective_wave64_mode();
+    let options = TranslateOptions { wave64 };
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, build(), wave64, container, translate),
         None => translate(container),
     }
 }
 
-/// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// The cache entry's converter: the build, the lowering mode and the
+/// container in, the encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
@@ -112,7 +147,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(&input[33..]).map_err(anyhow::Error::msg)?;
         self.translated.store(true, Ordering::Relaxed);
         Ok(encode(&shader))
     }
@@ -121,10 +156,12 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
+    mode: Wave64Mode,
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    let mb = [mode_byte(mode)];
+    let input = [&build[..], &mb[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
@@ -341,26 +378,48 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
-        // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        // Another Wave64 mode translates separately.
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Wave32, container, translate),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
+
+        // Another build translates again.
+        assert_eq!(
+            cached(&cache, &[8; 32], Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            Ok(shader())
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
 
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail).is_err());
+        assert!(cached(&cache, &build, Wave64Mode::Native, b"other", fail).is_err());
     }
 
     #[test]
@@ -373,10 +432,10 @@ mod tests {
         }
         let translate = |_: &[u8]| Ok(shader());
         let container = b"a console container".as_slice();
-        assert_eq!(cached(&cache, &[7; 32], container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &[7; 32], Wave64Mode::Native, container, translate), Ok(shader()));
         // A shader that does not translate still fails, with its own error.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        let error = cached(&cache, &[7; 32], b"other", fail).unwrap_err();
+        let error = cached(&cache, &[7; 32], Wave64Mode::Native, b"other", fail).unwrap_err();
         assert!(error.contains("unsupported"), "{error}");
     }
 

@@ -308,6 +308,45 @@ type Known = Vec<(Bool, bool)>;
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
 
+type ValueTables = (
+    Vec<Option<Site>>,
+    Vec<Option<(usize, usize)>>,
+    Vec<Option<Reg>>,
+);
+
+/// Indexes each SSA value's defining site, phi location, and input register.
+fn index_values(p: &Program) -> ValueTables {
+    let all = || {
+        p.inputs
+            .iter()
+            .map(|i| i.1)
+            .chain(p.blocks.iter().flat_map(|b| {
+                b.phis
+                    .iter()
+                    .map(|phi| phi.value)
+                    .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)))
+            }))
+    };
+    let n = all().map(|v| v.0 as usize + 1).max().unwrap_or(0);
+    let mut defs = vec![None; n];
+    let mut phis = vec![None; n];
+    let mut inputs = vec![None; n];
+    for &(reg, v) in &p.inputs {
+        inputs[v.0 as usize] = Some(reg);
+    }
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            phis[phi.value.0 as usize] = Some((b, i));
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                defs[v.0 as usize] = Some((b, i));
+            }
+        }
+    }
+    (defs, phis, inputs)
+}
+
 impl<'a> Tracer<'a> {
     fn new(
         p: &'a Program,
@@ -315,34 +354,8 @@ impl<'a> Tracer<'a> {
         stage: HwStage,
         lanes: Option<&'a Structured>,
     ) -> Result<Self, ShaderError> {
-        let all = || {
-            p.inputs
-                .iter()
-                .map(|i| i.1)
-                .chain(p.blocks.iter().flat_map(|b| {
-                    b.phis
-                        .iter()
-                        .map(|phi| phi.value)
-                        .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)))
-                }))
-        };
-        let n = all().map(|v| v.0 as usize + 1).max().unwrap_or(0);
-        let mut defs = vec![None; n];
-        let mut phis = vec![None; n];
-        let mut inputs = vec![None; n];
-        for &(reg, v) in &p.inputs {
-            inputs[v.0 as usize] = Some(reg);
-        }
-        for (b, block) in p.blocks.iter().enumerate() {
-            for (i, phi) in block.phis.iter().enumerate() {
-                phis[phi.value.0 as usize] = Some((b, i));
-            }
-            for (i, inst) in block.insts.iter().enumerate() {
-                for &(_, v) in &inst.writes {
-                    defs[v.0 as usize] = Some((b, i));
-                }
-            }
-        }
+        let (defs, phis, inputs) = index_values(p);
+        let n = defs.len();
         let mut rpo = vec![usize::MAX; p.blocks.len()];
         for (n, b) in crate::ir::reverse_postorder(&p.blocks)
             .into_iter()
@@ -1597,72 +1610,106 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
+}
+
+/// Resolves every `v_readlane_b32` reading a spilled SGPR back to its scalar value or constant.
+pub(crate) fn spilled_sgprs(p: &Program) -> std::collections::HashMap<Site, Moved> {
+    let (defs, phis, _) = index_values(p);
+    let mut out = std::collections::HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if let Some(m) = restored_with(p, &defs, &phis, inst) {
+                out.insert((b, i), m);
+            }
+        }
+    }
+    out
+}
+
+fn restored_with(
+    p: &Program,
+    defs: &[Option<Site>],
+    phis: &[Option<(usize, usize)>],
+    inst: &Inst,
+) -> Option<Moved> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    if inst.name() != "v_readlane_b32" {
+        return None;
+    }
+    let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
+        return None;
+    };
+    spilled_with(
+        p,
+        defs,
+        phis,
+        inst.read(Reg::V(reg))?,
+        lane_of(lane)?,
+        &mut Vec::new(),
+    )
+    .ok()
+    .flatten()
+}
+
+fn spilled_with(
+    p: &Program,
+    defs: &[Option<Site>],
+    phis: &[Option<(usize, usize)>],
+    v: Value,
+    lane: u32,
+    seen: &mut Vec<Value>,
+) -> Result<Option<Moved>, ()> {
+    if let Some((b, i)) = phis[v.0 as usize] {
+        if seen.contains(&v) {
+            return Ok(None);
+        }
+        seen.push(v);
+        let mut found = None;
+        for &a in &p.blocks[b].phis[i].args {
+            if let Some(m) = spilled_with(p, defs, phis, a, lane, seen)? {
+                if found.is_some_and(|f| f != m) {
+                    return Err(());
+                }
+                found = Some(m);
+            }
+        }
+        return Ok(found);
+    }
+    let (b, i) = defs[v.0 as usize].ok_or(())?;
+    let inst = &p.blocks[b].insts[i];
+    let Fields::Valu(w) = &inst.fields else {
+        return Err(());
+    };
+    let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+        return Err(());
+    };
+    if inst.name() != "v_writelane_b32" {
+        return Err(());
+    }
+    if lane_of(*at).ok_or(())? != lane {
+        return spilled_with(p, defs, phis, inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+    }
+    match *value {
+        Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).map(Moved::Value),
+        Operand::Literal(x) => Some(Moved::Const(x)),
+        Operand::Const(c) => inline(c).map(Moved::Const),
+        _ => None,
+    }
+    .map(Some)
+    .ok_or(())
 }
 
 impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
     fn restored(&self, inst: &Inst) -> Option<Moved> {
-        let Fields::Valu(v) = &inst.fields else {
-            return None;
-        };
-        if inst.name() != "v_readlane_b32" {
-            return None;
-        }
-        let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
-            return None;
-        };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
-    }
-
-    /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
-    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
-        if let Some((b, i)) = self.phis[v.0 as usize] {
-            if seen.contains(&v) {
-                return Ok(None);
-            }
-            seen.push(v);
-            let mut found = None;
-            for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
-                    if found.is_some_and(|f| f != m) {
-                        return Err(());
-                    }
-                    found = Some(m);
-                }
-            }
-            return Ok(found);
-        }
-        let inst = self.def(v).ok_or(())?;
-        let Fields::Valu(w) = &inst.fields else {
-            return Err(());
-        };
-        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
-            return Err(());
-        };
-        if inst.name() != "v_writelane_b32" {
-            return Err(());
-        }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
-        }
-        match *value {
-            Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Moved::Value)
-            }
-            Operand::Literal(x) => Some(Moved::Const(x)),
-            Operand::Const(c) => inline(c).map(Moved::Const),
-            _ => None,
-        }
-        .map(Some)
-        .ok_or(())
+        restored_with(self.p, &self.defs, &self.phis, inst)
     }
 }
 
