@@ -859,13 +859,11 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The hardware adapter and WARP, those there are.
+    /// Require the WARP adapter for this verification run.
     #[cfg(windows)]
     fn hosts() -> Vec<(&'static str, super::host::Host)> {
-        [("the default adapter", false), ("WARP", true)]
-            .into_iter()
-            .filter_map(|(name, warp)| Some((name, super::host::Host::new(warp).ok()?)))
-            .collect()
+        let host = super::host::Host::new(true).expect("WARP must support Shader Model 6.6");
+        vec![("WARP", host)]
     }
 
     /// What the GPU side makes for a buffer view of `count` elements of

@@ -240,9 +240,9 @@ fn dispatch(
 /// rewrites its entry and raw view.
 #[test]
 fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
-    let Some(heap) = HostHeap::new(false, 8) else {
-        return; // no host GPU
-    };
+    assert!(cfg!(feature = "diagnostics"));
+    assert!(std::env::var_os("VICTORY_D3D12_WARP").is_some());
+    let heap = HostHeap::new(false, 8).expect("WARP must supply a host view heap");
     let host = host().expect("the heap's host");
     let device = &host.device;
     let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -256,9 +256,8 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
             size_of_val(&model) as u32,
         )
     };
-    if queried.is_err() || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-        return; // translated shaders need SM 6.6
-    }
+    queried.expect("WARP shader model query must succeed");
+    assert!(model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0);
     // Title memory in two windows the host copies apart: what the program
     // reads in the first, what it writes in the second. (Nothing here
     // brings the copies up to date; the test fills them itself.)
@@ -365,10 +364,7 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
 /// slot. This exercises the release ordering without a scheduler race.
 #[test]
 fn retiring_slot_is_unavailable_until_its_alias_is_cleared() {
-    let Some(heap) = HostHeap::new(false, 1) else {
-        eprintln!("Skipping descriptor retirement test: no host view heap");
-        return;
-    };
+    let heap = HostHeap::new(false, 1).expect("WARP must supply a host view heap");
     let capacity = heap.alias_base() - heap.count();
     let first = heap.dynamic(capacity).expect("empty dynamic pool");
     let last = first + capacity - 1;

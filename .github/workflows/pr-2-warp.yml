@@ -1,0 +1,22 @@
+name: PR 2 D3D12 WARP readbacks
+
+on:
+  push:
+    branches: [verification/pr-2-warp]
+
+permissions:
+  contents: read
+
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      VICTORY_D3D12_WARP: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - name: Shader dispatch and readback
+        run: cargo test -p victory-shader --locked --lib unknown_stride -- --test-threads=1 --nocapture
+      - name: Raw descriptor view readback and retirement
+        run: cargo test -p victory-gpu --locked --lib --features diagnostics raw_view_tests -- --test-threads=1 --nocapture
