@@ -158,6 +158,19 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        if stages.iter().any(|(s, _)| s.stride_table) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::STRIDE_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -528,6 +541,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        stride_table: false,
     }
 }
 
@@ -907,6 +921,7 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -924,6 +939,13 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// A buffer UAV of this many dwords, zeroed, viewed as the stride says.
+    BufferUav(u32, Stride),
+    /// A raw view of `dwords` dwords from dword `first` of the buffer the
+    /// view at the (earlier) heap index `of` is made on, an SRV or a UAV as
+    /// that view is: what the GPU side makes for the runtime stride table
+    /// ([`super::RawWindow`]). Not among the UAVs read back.
+    RawAlias { of: usize, first: u32, dwords: u32 },
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1081,9 +1103,12 @@ impl Host {
             let mut keep = Vec::new();
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
+            // Buffer views by heap index: (buffer, dwords, unordered).
+            let mut buffers: Vec<Option<(ID3D12Resource, u32, bool)>> = Vec::new();
             for (i, v) in d.views.iter().enumerate() {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
+                buffers.push(None);
                 match *v {
                     View::Texture(..) | View::Cube(..) => {
                         let (w, h, texels, faces) = match *v {
@@ -1152,17 +1177,31 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
-                        // (dwords, format, elements, flags)
-                        let (n, format, elements, flags) = match *v {
+                    View::RawUav(_) | View::HalfUav(_) | View::BufferUav(..) => {
+                        // (dwords, format, elements, element bytes, flags)
+                        let (n, format, elements, stride, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
                                 e,
+                                0,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
-                            View::RawUav(n) => {
-                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            View::RawUav(n) | View::BufferUav(n, Stride::Raw) => {
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
+                            View::BufferUav(n, Stride::Typed) => (
+                                n,
+                                DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                n / 4,
+                                0,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::BufferUav(n, Stride::Structured(s)) => {
+                                (n, DXGI_FORMAT_UNKNOWN, n * 4 / s, s, D3D12_BUFFER_UAV_FLAG_NONE)
+                            }
+                            View::BufferUav(n, Stride::Format(f, bytes)) => {
+                                (n, f, n * 4 / bytes, 0, D3D12_BUFFER_UAV_FLAG_NONE)
                             }
                             _ => unreachable!(),
                         };
@@ -1178,12 +1217,14 @@ impl Host {
                             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
+                                    StructureByteStride: stride,
                                     Flags: flags,
                                     ..Default::default()
                                 },
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        buffers[i] = Some((b.clone(), n, true));
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1279,7 +1320,48 @@ impl Host {
                             },
                         };
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
+                        buffers[i] = Some((b.clone(), data.len() as u32, false));
                         keep.push(b);
+                    }
+                    View::RawAlias { of, first, dwords } => {
+                        let (b, n, unordered) = buffers
+                            .get(of)
+                            .cloned()
+                            .flatten()
+                            .ok_or("a raw alias of no earlier buffer view")?;
+                        if first + dwords > n {
+                            return Err("a raw alias past its buffer".into());
+                        }
+                        if unordered {
+                            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_UAV {
+                                        FirstElement: u64::from(first),
+                                        NumElements: dwords,
+                                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                        ..Default::default()
+                                    },
+                                },
+                            };
+                            dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        } else {
+                            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_SRV {
+                                        FirstElement: u64::from(first),
+                                        NumElements: dwords,
+                                        StructureByteStride: 0,
+                                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                    },
+                                },
+                            };
+                            dev.CreateShaderResourceView(&b, Some(&desc), at);
+                        }
                     }
                 }
             }
