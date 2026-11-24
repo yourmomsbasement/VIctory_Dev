@@ -356,7 +356,24 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
-    let original = emit_program(c, native, p, st, io, res);
+    let emit_with_interps = |p: &ir::Program,
+                             st: &structure::Structured,
+                             io: &io::Io,
+                             res: &resource::Resources| {
+        match emit_program(c, native, p, st, io, res) {
+            Err(ShaderError::Unsupported {
+                what: lower::FIRST_HALF,
+                ..
+            }) if native.stage == HwStage::Ps => {
+                // A first half can also feed arithmetic or survive at a join.
+                // Materialize its P0 + I * (P1 - P0) using the per-vertex path.
+                let io = io::raise_interps(p, native, true)?;
+                emit_program(c, native, p, st, &io, res)
+            }
+            result => result,
+        }
+    };
+    let original = emit_with_interps(p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -541,7 +558,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_with_interps(&p, &st, &io, &res).map(|(shader, _)| shader)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -1650,6 +1667,15 @@ mod barycentric_tests {
             .collect();
         indices.sort();
         assert_eq!(indices, [0, 1], "{inputs:?}");
+        validate(&shader);
+    }
+
+    #[test]
+    fn standalone_first_half_can_be_exported() {
+        let [e0, e1] = exp_mrt0(2);
+        let shader = pixel(&[0xC808_0000, e0, e1, 0xBF81_0000], PERSP_CENTER).unwrap();
+        let (_, inputs) = parts(&shader);
+        assert!(inputs.iter().any(|e| e.kind == 28));
         validate(&shader);
     }
 

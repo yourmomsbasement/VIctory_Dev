@@ -327,6 +327,7 @@ enum MaskData {
     None,
 }
 
+pub(super) const FIRST_HALF: Why = "the first half of an interpolation";
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
@@ -1352,6 +1353,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || matches!(n, "v_permlane16_b32" | "v_permlanex16_b32")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -7493,6 +7495,59 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                self.cross_lane(false)?;
+                if v.opsel & !2 != 0 || v.abs != 0 || v.neg != 0 {
+                    return Err("a lane permutation with fetch-inactive or unsupported modifiers");
+                }
+                let (value, low, high) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let (k7, k8) = (self.s.m.i32(7), self.s.m.i32(8));
+                let (k15, k16) = (self.s.m.i32(15), self.s.m.i32(16));
+                let zero = self.s.m.i32(0);
+                let half = self.s.m.bin(c, Bin::And, lane, k8);
+                let upper = self.s.m.cmp(c, pred::NE, half, zero);
+                let selectors = self.s.m.select(c, upper, high, low);
+                let nibble = self.s.m.bin(c, Bin::And, lane, k7);
+                let four = self.s.m.i32(4);
+                let shift = self.s.m.bin(c, Bin::Mul, nibble, four);
+                let shifted = self.s.m.bin(c, Bin::LShr, selectors, shift);
+                let pick = self.s.m.bin(c, Bin::And, shifted, k15);
+                let row_mask = self.s.m.i32(!15);
+                let mut row = self.s.m.bin(c, Bin::And, lane, row_mask);
+                if name == "v_permlanex16_b32" {
+                    row = self.s.m.bin(c, Bin::Xor, row, k16);
+                }
+                let source = self.s.m.bin(c, Bin::Or, row, pick);
+                // FI clear: an inactive source either leaves the destination
+                // alone or writes zero (BOUND_CTRL). Never shuffle from an
+                // inactive host lane, whose value DXIL leaves undefined.
+                let active = guard.unwrap_or_else(|| self.s.m.bool(true));
+                let i32t = self.s.t.i32;
+                let four_words = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let ballot = self.s.op(
+                    c, "waveActiveBallot", Attr::NoUnwind, four_words, 116, &[active],
+                );
+                let (lo, hi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
+                let k32 = self.s.m.i32(32);
+                let high_half = self.s.m.cmp(c, pred::IUGE, source, k32);
+                let mask = self.s.m.select(c, high_half, hi, lo);
+                let k31 = self.s.m.i32(31);
+                let bit = self.s.m.bin(c, Bin::And, source, k31);
+                let one = self.s.m.i32(1);
+                let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+                let active_bit = self.s.m.bin(c, Bin::And, mask, bit);
+                let available = self.s.m.cmp(c, pred::NE, active_bit, zero);
+                let safe_source = self.s.m.select(c, available, source, lane);
+                let fetched = self.read_lane(value, safe_source);
+                if v.opsel & 2 != 0 {
+                    let value = self.s.m.select(c, available, fetched, zero);
+                    int(self, value)
+                } else {
+                    let write = self.s.m.bin(c, Bin::And, active, available);
+                    self.write_i(inst, fetched, Some(write))
+                }
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -9067,7 +9122,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            return Err(FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {
