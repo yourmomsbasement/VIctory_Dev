@@ -3277,6 +3277,35 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The handle and (element, byte) coordinates of a buffer access at byte
+    /// `off` with no index (`idxen` clear). A buffer the console declares
+    /// structured (a stride of 4 or more, a multiple of 4) is viewed
+    /// structured by the host, as for indexed accesses: a raw handle on that
+    /// view is invalid and NVIDIA reads zeros, so it takes the structured
+    /// handle at `off / stride`, `off % stride`. Others stay raw. `u` is
+    /// `0x1000` for a UAV.
+    fn byte_access(
+        &mut self,
+        site: Site,
+        src: &Source,
+        used: Option<&UsedResource>,
+        u: u32,
+        off: V,
+    ) -> Result<(V, V, V), Why> {
+        let stride = used.map_or(0, |u| u.stride);
+        if stride >= 4 && stride.is_multiple_of(4) {
+            let h = self.handle(site, src, false, (12 | u, stride))?;
+            let c = self.cur;
+            let s = self.s.m.i32(stride);
+            let index = self.s.m.bin(c, Bin::UDiv, off, s);
+            let within = self.s.m.bin(c, Bin::URem, off, s);
+            Ok((h, index, within))
+        } else {
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            Ok((h, off, self.s.m.undef(self.s.t.i32)))
+        }
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -6303,7 +6332,10 @@ impl<'a> Lower<'a> {
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => {
+                    let (h, index, within) = self.byte_access(site, src, used, u, off)?;
+                    (h, [index, within, iu])
+                }
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -6387,8 +6419,9 @@ impl<'a> Lower<'a> {
                         args.extend([index, off]);
                     }
                     None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
+                        let (h, index, within) = self.byte_access(site, src, used, u, off)?;
+                        args.push(h);
+                        args.extend([index, within]);
                     }
                 }
                 args.extend(&vals);
@@ -6455,14 +6488,14 @@ impl<'a> Lower<'a> {
                     )
                 }
                 None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let (h, index, within) = self.byte_access(site, src, used, u, off)?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, off, iu, mask, align],
+                        &[h, index, within, mask, align],
                     )
                 }
             }
