@@ -870,36 +870,39 @@ fn host_texture(
         value[0] = pc_format(value[0]);
         value
     });
-    let (mut s1, _) = host.format_support(d.format);
-    let need_rtv = d.flags & RENDER_TARGET != 0
-        && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0;
-    let need_uav = d.flags & UNORDERED != 0
-        && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0;
-    let promoted = match d.format {
-        67 if need_rtv || need_uav => Some(26),
-        115 if need_rtv || need_uav => Some(87),
-        86 if need_rtv => Some(87),
-        _ => None,
-    };
-    if let Some(target) = promoted {
-        d.format = target;
-        if let Some(v) = clear_value.as_mut() {
-            v[0] = target;
+    let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
+    if !typeless {
+        let (mut s1, _) = host.format_support(d.format);
+        let need_rtv = d.flags & RENDER_TARGET != 0
+            && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0;
+        let need_uav = d.flags & UNORDERED != 0
+            && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0;
+        let promoted = match d.format {
+            67 if need_rtv || need_uav => Some(26),
+            115 if need_rtv || need_uav => Some(87),
+            86 if need_rtv => Some(87),
+            _ => None,
+        };
+        if let Some(target) = promoted {
+            d.format = target;
+            if let Some(v) = clear_value.as_mut() {
+                v[0] = target;
+            }
+            s1 = host.format_support(target).0;
         }
-        s1 = host.format_support(target).0;
-    }
-    if d.flags & UNORDERED != 0
-        && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0
-    {
-        d.flags &= !UNORDERED;
-    }
-    if d.flags & RENDER_TARGET != 0
-        && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0
-    {
-        d.flags &= !RENDER_TARGET;
-    }
-    if d.flags & (RENDER_TARGET | DEPTH) == 0 {
-        clear_value = None;
+        if d.flags & UNORDERED != 0
+            && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0
+        {
+            d.flags &= !UNORDERED;
+        }
+        if d.flags & RENDER_TARGET != 0
+            && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0
+        {
+            d.flags &= !RENDER_TARGET;
+        }
+        if d.flags & (RENDER_TARGET | DEPTH) == 0 {
+            clear_value = None;
+        }
     }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -1924,6 +1927,19 @@ mod tests {
             let clear = [format, 0, 0, 0, 0];
             let res = host_texture(&tex(format, flags), 0, clear.as_ptr().cast());
             assert!(res.is_some(), "format {format} flags {flags} failed");
+        }
+        {
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            };
+            let srgb_uav = host_texture(&tex(29, 5), 0, std::ptr::null()).expect("format 29 flags 5");
+            // SAFETY: a live D3D12 resource.
+            let d = unsafe { srgb_uav.GetDesc() };
+            assert_eq!(d.Format.0, 27);
+            let expected = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+                | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
+            assert_eq!(d.Flags.0 & expected, expected);
         }
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
