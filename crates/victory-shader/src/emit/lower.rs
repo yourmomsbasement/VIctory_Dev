@@ -6994,6 +6994,16 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
             }
+            "v_cvt_f32_f64" => {
+                let (lo, hi) = self.src64_pair(inst, 0)?;
+                self.s.flags |= flags::DOUBLE;
+                let f64t = self.s.m.double();
+                let d = self
+                    .s
+                    .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+                let r = self.s.m.cast(c, Cast::FpTrunc, d, self.s.t.f32);
+                float(self, r)
+            }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
                 // f16 half; neg_hi is the absolute value here.
@@ -7306,6 +7316,49 @@ impl<'a> Lower<'a> {
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
+            }
+        }
+    }
+
+    /// The low and high 32-bit halves of a 64-bit source (without `INT64`).
+    fn src64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))
+            }
+            Operand::Const(k @ 128..=208) => {
+                let x = crate::resource::inline(k).ok_or("a special operand")?;
+                let lo = self.s.m.i32(x);
+                let hi = self.s.m.i32(((x as i32) >> 31) as u32);
+                Ok((lo, hi))
+            }
+            Operand::Const(code @ 240..=248) => {
+                let bits = if code == 248 {
+                    (std::f64::consts::FRAC_1_PI / 2.0).to_bits()
+                } else {
+                    let single = crate::resource::inline(code).ok_or("a special operand")?;
+                    f64::from(f32::from_bits(single)).to_bits()
+                };
+                Ok((self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32)))
+            }
+            // A literal supplies the upper word of an f64, with a zero low word.
+            Operand::Literal(hi) => Ok((self.s.m.i32(0), self.s.m.i32(hi))),
+            _ => {
+                let x = self.operand(inst, &op)?;
+                Ok((x, self.s.m.i32(0)))
             }
         }
     }
@@ -9362,6 +9415,12 @@ impl<'a> Lower<'a> {
                         let y = addr_packed(self, first + deriv_regs, k)?;
                         g[3 + k] = to_float(self, y);
                     }
+                    let clamp = if name == "image_sample_d_cl" {
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
                     args.extend(&os);
                     args.extend(g);
                     args.push(clamp);
@@ -11335,5 +11394,21 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn v_cvt_f32_f64_lowers_with_double_flag() {
+        let words = [
+            0x7E00_1F00, // v_cvt_f32_f64 v0, v[0:1]
+            0xD834_0000, // ds_write_b32 v0, v0 keeps the conversion live
+            0,
+            S_ENDPGM,
+        ];
+        let emitted = lower_with(&words, vec![], vec![]).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let features = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(features & 1, 1, "SFI0 double-precision feature");
+        assert_eq!(super::flags::DOUBLE, 1 << 2, "DXIL double-precision flag");
     }
 }
