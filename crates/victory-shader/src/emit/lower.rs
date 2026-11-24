@@ -62,6 +62,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// With breadcrumbs (see [`super::breadcrumbs`]): the shader's slot.
+    pub crumbs: Option<u32>,
 }
 
 enum Stop {
@@ -238,6 +240,9 @@ struct Lower<'a> {
     /// so the function has a single exit as DXC emits it (dxil-spirv, under
     /// Proton, cannot structure a loop left by both a break and a return).
     ret: Option<usize>,
+    /// Breadcrumbs: the loops that store their count, by header, in the
+    /// order met (the word each owns in the shader's slot).
+    crumb_loops: HashMap<usize, u32>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -607,6 +612,7 @@ impl<'a> Lower<'a> {
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
+            crumb_loops: HashMap::new(),
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -1038,6 +1044,8 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
+            // A breadcrumb may have ended the block (a back edge's counting).
+            self.tail[b] = Some(self.cur);
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
@@ -1310,15 +1318,19 @@ impl<'a> Lower<'a> {
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword;
-        self.user_reads.insert(
+        let data = UserData {
             index,
-            UserData {
-                index,
-                slot: rp.slot,
-                root: rp.root,
-                dword,
-            },
-        );
+            slot: rp.slot,
+            root: rp.root,
+            dword,
+        };
+        Val::I32(self.user_dword(data))
+    }
+
+    /// The entry-block load of user-data dword `data`.
+    fn user_dword(&mut self, data: UserData) -> V {
+        let index = data.index;
+        self.user_reads.insert(index, data);
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,
@@ -1338,7 +1350,7 @@ impl<'a> Lower<'a> {
             59,
             &[h, row],
         );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+        self.s.m.extract(entry, r, index % 4)
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -7136,12 +7148,60 @@ impl<'a> Lower<'a> {
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         let limit = self.s.m.i32(super::loop_limit());
+        // The breadcrumb may end the block (a store of one lane), so the
+        // back edge leaves from where it ends.
+        self.crumb(to, next);
+        let c = self.cur;
         self.counters
             .get_mut(&to)
             .expect("header")
             .1
             .push((next, c));
         self.s.m.cmp(c, p, next, limit)
+    }
+
+    /// Breadcrumbs (see [`super::breadcrumbs`]): the count of the loop at
+    /// header `to` goes to its word of the shader's slot, as the largest
+    /// any lane reached: the wave's largest, stored by its first active lane
+    /// (one atomic a wave, not one a lane). The buffer's UAV is the view
+    /// heap's entry at the index in the first user-data dword past the
+    /// console's.
+    fn crumb(&mut self, to: usize, count: V) {
+        let Some(slot) = self.x.crumbs else { return };
+        let next = self.crumb_loops.len() as u32;
+        let n = *self.crumb_loops.entry(to).or_insert(next);
+        if n >= super::BREADCRUMB_LOOPS {
+            return;
+        }
+        let first = self
+            .x
+            .native
+            .layout
+            .iter()
+            .map(|r| u32::from(r.user_data) + r.sgprs)
+            .max()
+            .unwrap_or(0);
+        let index = self.user_dword(UserData {
+            index: first,
+            slot: 0,
+            root: super::BREADCRUMB_ROOT,
+            dword: 0,
+        });
+        let c = self.cur;
+        let (i1, i32t) = (self.s.t.i1, self.s.t.i32);
+        self.s.flags |= flags::WAVE_OPS;
+        // The largest count of the lanes that take the back edge (unsigned max).
+        let (k, u) = (self.s.m.i8(3), self.s.m.i8(1));
+        let count = self.s.op(c, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[count, k, u]);
+        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+        let guarded = self.begin_guarded(Some(first));
+        let c = self.cur;
+        // A raw buffer UAV (`atomicMax`, operation 7, at the word's byte offset).
+        let h = self.s.heap_handle(c, index, false, false, (11 | 0x1000, 0));
+        let at = self.s.m.i32((slot * super::BREADCRUMB_LOOPS + n) * 4);
+        let (op, unused) = (self.s.m.i32(7), self.s.m.undef(i32t));
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, op, at, unused, unused, count]);
+        self.end_guarded(guarded, &[]);
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
@@ -7325,6 +7385,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            crumbs: None,
         })
         .map(|_| ())
     }
@@ -7375,7 +7436,72 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            crumbs: None,
         })
+    }
+
+    /// A counted loop (`s5` from 0 to 4) in a compute program with one root
+    /// constant in `s0`, lowered with breadcrumbs for `crumbs`.
+    fn counted_loop(crumbs: Option<u32>) -> Lowered {
+        let words = [
+            0xBE85_0380u32, // s_mov_b32 s5, 0
+            0x8005_8105,    // s_add_u32 s5, s5, 1
+            0xBF0A_8405,    // s_cmp_lt_u32 s5, 4
+            0xBF85_FFFD,    // s_cbranch_scc1 -3
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![root(RootType::Constants, 0, 0)],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | 2 << 1, threads: [1, 1, 1] }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            crumbs,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn breadcrumbs_add_a_loop_store_and_one_user_data_dword() {
+        let plain = counted_loop(None);
+        assert!(plain.user_data.iter().all(|u| u.root != crate::emit::BREADCRUMB_ROOT));
+        let crumbs = counted_loop(Some(7));
+        // The store (and the heap handle it goes through) are in the module.
+        assert!(crumbs.dxil.len() > plain.dxil.len());
+        assert!(crumbs.wave_ops && !plain.wave_ops);
+        // The first dword past the console's (one root constant: s0).
+        let heap_index: Vec<_> = crumbs
+            .user_data
+            .iter()
+            .filter(|u| u.root == crate::emit::BREADCRUMB_ROOT)
+            .collect();
+        assert_eq!(heap_index.len(), 1);
+        assert_eq!(heap_index[0].index, 1);
+        // Everything else is unchanged.
+        assert_eq!(
+            crumbs.user_data.len(),
+            plain.user_data.len() + 1,
+            "{:?}",
+            crumbs.user_data
+        );
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
@@ -7478,6 +7604,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            crumbs: None,
         }).unwrap();
 
         let container =
@@ -7848,6 +7975,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            crumbs: None,
         })
     }
 
@@ -8178,6 +8306,7 @@ mod tests {
             outputs: vec![pos_sig.clone(), col_sig.clone()],
             prims: vec![],
             mesh_stride: 4,
+            crumbs: None,
         })
         .unwrap();
         assert!(
@@ -8322,6 +8451,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            crumbs: None,
         })
         .unwrap();
         assert!(

@@ -507,6 +507,11 @@ impl HostPipeline {
         // The debug view's pixel shader, one output per colour target.
         let debug = (compute.is_none() && debug)
             .then(|| victory_shader::emit::debug_ps(g.map_or(1, |g| g.targets.NumRenderTargets)));
+        for (s, _) in &stages {
+            if crate::breadcrumb::enabled() {
+                crate::breadcrumb::note_stage(&s.container, &format!("{shaders:?}"));
+            }
+        }
         let code = |i: usize| {
             if i == 1
                 && let Some(d) = &debug

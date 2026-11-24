@@ -299,6 +299,17 @@ impl State {
         };
     }
 
+    /// The bound view heap's breadcrumb entry, which shaders store loop
+    /// counts through (see [`crate::breadcrumb`]).
+    fn breadcrumb_slot(&self) -> u32 {
+        let heap = self.heaps[0];
+        (heap != 0)
+            .then(|| crate::descriptor::heap(heap as This).host())
+            .flatten()
+            .and_then(|h| h.breadcrumb_slot())
+            .unwrap_or(0)
+    }
+
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value.
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
@@ -482,6 +493,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        None if u.root == victory_shader::emit::BREADCRUMB_ROOT => self.breadcrumb_slot(),
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }

@@ -22,6 +22,9 @@ pub(crate) struct HostHeap {
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
+    /// With shader breadcrumbs: the slot after the dynamic ones holds the
+    /// breadcrumb buffer's UAV (see [`crate::breadcrumb`]).
+    crumb: bool,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -162,16 +165,19 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        // With breadcrumbs the last of the dynamic slots is kept for the buffer's UAV.
+        let crumb = u32::from(!sampler && crate::breadcrumb::enabled());
         let h = HostHeap {
             heap,
             cpu,
             step,
             count,
-            dynamic: extra,
+            dynamic: extra - crumb,
+            crumb: crumb == 1,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![false; (extra - crumb) as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -182,6 +188,9 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        if let Some(at) = h.breadcrumb_slot() {
+            crate::breadcrumb::describe(&host.device, h.cpu(at));
+        }
         Some(h)
     }
 
@@ -281,6 +290,11 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// The slot of the breadcrumb buffer's UAV, with breadcrumbs on.
+    pub(crate) fn breadcrumb_slot(&self) -> Option<u32> {
+        self.crumb.then_some(self.count + self.dynamic)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's

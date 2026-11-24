@@ -161,6 +161,40 @@ pub fn host_wave_max() -> u32 {
     }
 }
 
+/// Whether translated loops leave breadcrumbs: with the `diagnostics` feature
+/// and `VICTORY_SHADER_BREADCRUMBS=1`, each loop of a shader stores its
+/// iteration count (`atomicMax`) in a host buffer, so that after a hung or
+/// removed device the host can name the shaders whose loops ran away. The
+/// buffer is `BREADCRUMB_SLOTS` slots of `BREADCRUMB_LOOPS` words, a
+/// shader's slot taken from its container's digest ([`breadcrumb_slot`]);
+/// the shader finds the buffer's UAV in the bound view heap, at the index
+/// the host passes in the user-data dword of root type [`BREADCRUMB_ROOT`]
+/// (the first past the console's). Off, nothing changes: not the code, nor
+/// the root signature, nor the shader cache's key. The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn breadcrumbs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_SHADER_BREADCRUMBS").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+/// The root type of the user-data dword that holds the heap index of the
+/// breadcrumb buffer's UAV (see [`breadcrumbs`]).
+pub const BREADCRUMB_ROOT: crate::native::RootType = crate::native::RootType::Other(0x00B8_EADC);
+
+/// Slots of the breadcrumb buffer, and loops (words) per slot: a shader
+/// beyond the eighth loop leaves none for it.
+pub const BREADCRUMB_SLOTS: u32 = 1024;
+pub const BREADCRUMB_LOOPS: u32 = 8;
+
+/// The breadcrumb slot of the shader whose container has `digest` (two
+/// shaders may share one; the host lists them all).
+pub fn breadcrumb_slot(digest: &[u8; 16]) -> u32 {
+    (u32::from(digest[0]) | u32::from(digest[1]) << 8) % BREADCRUMB_SLOTS
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -327,6 +361,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        crumbs: breadcrumbs().then(|| breadcrumb_slot(&c.digest)),
     })?;
     Ok(HostShader {
         stage: native.stage,

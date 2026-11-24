@@ -102,6 +102,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
+            if let Some(crumbs) = crate::breadcrumb::report() {
+                text.push_str(&format!("; {crumbs}"));
+            }
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
@@ -558,6 +561,7 @@ impl Host {
     }
 
     fn submit(&self, submitted: &mut u64, runs: &[&HostList]) {
+        crate::breadcrumb::clear();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
