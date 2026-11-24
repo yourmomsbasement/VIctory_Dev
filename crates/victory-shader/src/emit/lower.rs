@@ -43,6 +43,12 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Names of declared functions (`dx.op.*`, `main`) in the emitted module.
+    #[cfg(test)]
+    pub op_names: Vec<String>,
+    /// Emitted module instructions formatted via `Module::inst_lines`.
+    #[cfg(test)]
+    pub insts: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -204,6 +210,10 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// SCC of each scalar operation writing a tracked lane mask (or `s_bcnt1`
+    /// testing whether any bit of a tracked lane mask is set), keyed to the
+    /// mask's low dword.
+    mask_scc: HashMap<Value, Value>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -288,6 +298,43 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
         _ => false,
     })
+}
+
+/// SCC of each scalar operation writing a tracked lane mask (or `s_bcnt1`
+/// testing whether any bit of a tracked lane mask is set), with the mask's
+/// low dword (EXEC's new value for the `saveexec` forms).
+fn mask_sccs(st: &Structured, p: &crate::ir::Program) -> HashMap<Value, Value> {
+    let mut out = HashMap::new();
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            continue;
+        };
+        let Some(scc) = inst.write(Reg::Scc) else {
+            continue;
+        };
+        let bcnt = if p.wave64 {
+            "s_bcnt1_i32_b64"
+        } else {
+            "s_bcnt1_i32_b32"
+        };
+        let lo = if inst.name() == bcnt {
+            match src.first() {
+                Some(&Operand::Scalar { code, .. }) if code != NULL => inst.read(Reg::S(code)),
+                _ => None,
+            }
+        } else if inst.name().contains("saveexec") {
+            inst.write(Reg::S(EXEC))
+        } else {
+            match *dst {
+                Some(Operand::Scalar { code, .. }) => inst.write(Reg::S(code)),
+                _ => None,
+            }
+        };
+        if let Some(lo) = lo.filter(|lo| st.masks.contains_key(lo)) {
+            out.insert(scc, lo);
+        }
+    }
+    out
 }
 
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
@@ -590,6 +637,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            mask_scc: mask_sccs(x.st, x.p),
             balloting: HashSet::new(),
             def_block: p
                 .blocks
@@ -1005,6 +1053,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            op_names: self.s.m.func_names().map(str::to_owned).collect(),
+            #[cfg(test)]
+            insts: self.s.m.inst_lines(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -1205,17 +1257,31 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn is_mask_value(&self, v: Value) -> bool {
+        self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)
+    }
+
+    fn mask_scc_source(&self, why: Why, v: Value) -> Option<Value> {
+        let can = self.mask_ok || why == LANE_MASK;
+        can.then(|| self.mask_scc.get(&v).copied()).flatten()
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
-        let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
+        let is_mask = self.is_mask_value(v);
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                if let Some(lo) = self.mask_scc_source(w, v) {
+                    return self.mask_any(lo).map(Val::Bit);
+                }
+                return Err(w);
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -1313,6 +1379,26 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Whether some lane of the mask with low dword `lo` is set, as data
+    /// (SCC of the operation writing it or `s_bcnt1`): its ballot is not zero.
+    fn mask_any(&mut self, lo: Value) -> Result<V, Why> {
+        self.mask_any_in(self.cur, lo)
+    }
+
+    /// Emits [`Self::mask_any`] into DXIL block `at` (while `self.cur` holds the
+    /// block where any local ballot for `self.cur_ir` belongs).
+    fn mask_any_in(&mut self, at: usize, lo: Value) -> Result<V, Why> {
+        let x = self.mask_dword(lo)?;
+        let (_, y) = self.ballots[&lo];
+        let any = if self.x.p.wave64 {
+            self.s.m.bin(at, Bin::Or, x, y)
+        } else {
+            x
+        };
+        let z = self.s.m.i32(0);
+        Ok(self.s.m.cmp(at, pred::NE, any, z))
     }
 
     // ---- operands ----
@@ -7123,20 +7209,51 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            let live = self.read_phis.contains(&phi.value);
+            let has_data = !bit
+                && !self.is_mask_value(phi.value)
+                && p.blocks[b]
+                    .preds
+                    .iter()
+                    .zip(&phi.args)
+                    .any(|(&q, &a)| {
+                        self.tail[q].is_some()
+                            && !self.is_mask_value(a)
+                            && matches!(self.vals.get(&a), Some(Val::I32(_)))
+                    });
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let Some(tail_q) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(tail_q);
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Bit(_)), false) if live => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    // A dead lane-mask dword reaching a join that also takes
+                    // data (registers reused after the mask died): undefined on
+                    // that edge, assuming reads come only from the data path.
+                    (Some(Val::Missing(_)), false)
+                        if live && has_data && self.is_mask_value(arg) =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
+                    }
+                    (Some(Val::Missing(why)), true) if live => {
+                        let Some(lo) = self.mask_scc_source(why, arg) else {
+                            return Err(Stop::Retry(phi.value, why));
+                        };
+                        let saved_ir = std::mem::replace(&mut self.cur_ir, q);
+                        let saved_cur = std::mem::replace(&mut self.cur, tail_q);
+                        let res = self.mask_any_in(qb, lo);
+                        self.cur = saved_cur;
+                        self.cur_ir = saved_ir;
+                        res.map_err(|w| Stop::Retry(phi.value, w))?
+                    }
+                    (Some(Val::Missing(why)), _) if live => {
                         return Err(Stop::Retry(phi.value, why));
                     }
-                    _ if self.read_phis.contains(&phi.value) => {
+                    _ if live => {
                         return Err(Stop::Retry(phi.value, "a join of mismatched values"));
                     }
                     _ if bit => self.s.m.bool(false),
@@ -7677,5 +7794,571 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    fn validate_dxil_blob(dxil: &[u8]) {
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil.to_vec())
+                .expect("DXIL validation failed");
+        }
+    }
+
+    fn wave64_ms_io() -> StageIo {
+        StageIo::Ms(crate::native::MeshIo {
+            outputs: vec![],
+            clip_cntl: 0,
+            threads: 64,
+            max_vertices: 3,
+            max_primitives: 1,
+            topology: 2,
+            lds_bytes: 0,
+        })
+    }
+
+    fn lower_program(
+        words: &[u32],
+        stage: HwStage,
+        wave64: bool,
+        io_stage: StageIo,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage,
+            wave64,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: io_stage,
+            code,
+        };
+        let p = ir::build(&native.code, wave64, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    #[test]
+    fn mask_dword_at_data_join_emits_undef_and_rejects_mask_only_joins() {
+        // Dead lane-mask dword (`s9`, upper half of `s[8:9]`; and `s8`, lower half) joined with
+        // concrete data (`45`) emits `undef` on the mask's edge instead of failing as a data read.
+        for (s_mov_dst, v_mov_src) in [
+            (0xBE89_03ADu32, 0x7E00_0209u32),
+            (0xBE88_03ADu32, 0x7E00_0208u32),
+        ] {
+            let words = [
+                0x7E08_0500, // v_readfirstlane_b32 s4, v0
+                0xBF06_8004, // s_cmp_eq_u32 s4, 0
+                0xBF85_0002, // s_cbranch_scc1 +2
+                0x8588_807E, // s_cselect_b64 s[8:9], exec, 0
+                0xBF82_0001, // s_branch +1
+                s_mov_dst,   // s_mov_b32 s9/s8, 45
+                v_mov_src,   // v_mov_b32 v0, s9/s8
+                0xF800_08CF,
+                0x0000_0000, // exp pos0, v0, v0, v0, v0 done
+                0xF800_094F,
+                0x0000_0000, // exp prim0, v0, v0, v0, v0 done
+                S_ENDPGM,
+            ];
+            let l = lower_program(&words, HwStage::Ms, true, wave64_ms_io())
+                .expect("dead mask dword joined with data should lower via undef");
+            assert!(
+                l.insts
+                    .iter()
+                    .any(|s| s.starts_with("phi ") && s.contains("undef")),
+                "expected phi with undef on mask edge in {:?}",
+                l.insts
+            );
+            validate_dxil_blob(&l.dxil);
+        }
+
+        // Negative 1: joining two lane masks and reading as data must still fail.
+        let mask_only_join = [
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF85_0002, // s_cbranch_scc1 +2
+            0x8588_807E, // s_cselect_b64 s[8:9], exec, 0
+            0xBF82_0001, // s_branch +1
+            0xBE88_047E, // s_mov_b64 s[8:9], exec
+            0x7E00_0209, // v_mov_b32 v0, s9
+            0xF800_08CF,
+            0x0000_0000,
+            0xF800_094F,
+            0x0000_0000,
+            S_ENDPGM,
+        ];
+        let err = lower_program(&mask_only_join, HwStage::Ms, true, wave64_ms_io())
+            .err()
+            .expect("mask-only join read as data should fail");
+        assert!(
+            err.to_string().contains("a lane mask read as data"),
+            "expected lane mask error, got {err}"
+        );
+
+        // Negative 2: tracked mask phi (`s2` in st.masks) read as data must still fail.
+        let cnd_s2 = 0x81 | (0x82 << 9) | (2 << 18); // v_cndmask_b32 v1, 1, 2, s2
+        let tracked_mask_phi = [
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF85_0003, // s_cbranch_scc1 +3
+            0xD4C2_0002,
+            0x0002_0080, // v_cmp_eq_u32_e64 s2, 0, v0
+            0xBF82_0001, // s_branch +1
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xD501_0001,
+            cnd_s2,      // v_cndmask_b32 v1, 1, 2, s2 (makes phi s2 a tracked mask in st.masks)
+            0x7E00_0202, // v_mov_b32 v0, s2
+            0xF800_08CF,
+            0x0000_0000,
+            0xF800_094F,
+            0x0000_0000,
+            S_ENDPGM,
+        ];
+        let err = lower_program(&tracked_mask_phi, HwStage::Ms, true, wave64_ms_io())
+            .err()
+            .expect("tracked mask phi read as data should fail");
+        assert!(
+            err.to_string().contains("a lane mask read as data"),
+            "expected tracked mask phi error, got {err}"
+        );
+    }
+
+    #[test]
+    fn s_bcnt1_scc_only_translates_while_numeric_popcount_still_fails() {
+        // Wave64 Mesh (`MaskData::None`): `s_bcnt1` whose count dst (`s12`) is overwritten
+        // and whose `SCC` drives `s_cbranch_scc1` translates as `(waveActiveBallot != 0)`,
+        // not `countbits`.
+        let direct_scc = [
+            0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+            0x898C_7E6A, // s_xor_b64 s[12:13], vcc, exec
+            0xBE8C_100C, // s_bcnt1_i32_b64 s12, s[12:13]
+            0xBE8C_0381, // s_mov_b32 s12, 1
+            0xBF85_0002, // s_cbranch_scc1 +2
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xBF82_0001, // s_branch +1
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xF800_08CF,
+            0x0101_0101, // exp pos0, v1, v1, v1, v1 done
+            0xF800_094F,
+            0x0101_0101, // exp prim0, v1, v1, v1, v1 done
+            S_ENDPGM,
+        ];
+        let l = lower_program(&direct_scc, HwStage::Ms, true, wave64_ms_io())
+            .expect("s_bcnt1 SCC-only branch should lower on Mesh MaskData::None");
+        assert!(
+            l.op_names.iter().any(|n| n == "dx.op.waveActiveBallot"),
+            "expected waveActiveBallot for s_bcnt1 SCC, got {:?}",
+            l.op_names
+        );
+        assert!(
+            !l.op_names.iter().any(|n| n == "dx.op.unaryBits.i32"),
+            "unexpected numeric countbits in {:?}",
+            l.op_names
+        );
+        validate_dxil_blob(&l.dxil);
+
+        // Reg::Scc phi join where one incoming edge sets SCC via `s_bcnt1`.
+        let joined_scc = [
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF85_0005, // s_cbranch_scc1 +5
+            0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+            0x898C_7E6A, // s_xor_b64 s[12:13], vcc, exec
+            0xBE8C_100C, // s_bcnt1_i32_b64 s12, s[12:13]
+            0xBE8C_0381, // s_mov_b32 s12, 1
+            0xBF82_0001, // s_branch +1
+            0xBF06_8104, // s_cmp_eq_u32 s4, 1
+            0xBF85_0002, // s_cbranch_scc1 +2
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xBF82_0001, // s_branch +1
+            0x7E02_0289, // v_mov_b32 v1, 9
+            0xF800_08CF,
+            0x0101_0101,
+            0xF800_094F,
+            0x0101_0101,
+            S_ENDPGM,
+        ];
+        let lj = lower_program(&joined_scc, HwStage::Ms, true, wave64_ms_io())
+            .expect("Reg::Scc phi from s_bcnt1 should lower cleanly");
+        assert!(
+            lj.op_names.iter().any(|n| n == "dx.op.waveActiveBallot"),
+            "expected waveActiveBallot for s_bcnt1 SCC phi, got {:?}",
+            lj.op_names
+        );
+        validate_dxil_blob(&lj.dxil);
+
+        // Negative 1: reading s_bcnt1's numeric popcount dst (`s12`) must still fail as a mask read.
+        let numeric_popcount = [
+            0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+            0x898C_7E6A, // s_xor_b64 s[12:13], vcc, exec
+            0xBE8C_100C, // s_bcnt1_i32_b64 s12, s[12:13]
+            0xBF85_0002, // s_cbranch_scc1 +2
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xBF82_0001, // s_branch +1
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xF800_08CF,
+            0x0101_0101,
+            0xF800_094F,
+            0x0101_0101,
+            S_ENDPGM,
+        ];
+        let err = lower_program(&numeric_popcount, HwStage::Ms, true, wave64_ms_io())
+            .err()
+            .expect("numeric s_bcnt1 popcount read as data should fail");
+        assert!(
+            err.to_string().contains("a lane mask read as data"),
+            "expected numeric popcount error, got {err}"
+        );
+
+        // Negative 2: wave64 shader running 32-bit `s_bcnt1_i32_b32` on a mask must not broaden
+        // to 64 lanes.
+        let wave64_b32_scc = [
+            0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+            0xBE8C_0F6A, // s_bcnt1_i32_b32 s12, vcc_lo
+            0xBE8C_0381, // s_mov_b32 s12, 1
+            0xBF85_0002, // s_cbranch_scc1 +2
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xBF82_0001, // s_branch +1
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xF800_08CF,
+            0x0101_0101,
+            0xF800_094F,
+            0x0101_0101,
+            S_ENDPGM,
+        ];
+        let err = lower_program(&wave64_b32_scc, HwStage::Ms, true, wave64_ms_io())
+            .err()
+            .expect("wave64 s_bcnt1_i32_b32 SCC read on a mask should fail");
+        assert!(
+            err.to_string().contains("a lane mask read as data"),
+            "expected wave64 b32 s_bcnt1 error, got {err}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn s_bcnt1_scc_branch_stays_wave_uniform_on_warp() {
+        use super::super::container::{SigElement, signature};
+        use super::super::host::{Dispatch, Host, Root, View};
+        use super::super::host::Draw;
+        use crate::dxbc::{Container, FourCC, build as dxbc_build};
+        use crate::native::{MeshIo, PsInput, Usage, VsOutput};
+
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let host = Host::new(true).expect("WARP SM 6.6 device");
+
+        // 1. Wave32 mesh shader (4 threads = 1 WARP wave) in `MaskData::None`:
+        // only lane 0 sets `vcc`, `s_bcnt1_i32_b32` writes `s20`, `s20` is overwritten,
+        // and `s_cbranch_scc1` must stay wave-uniform (all 3 vertices take 0.75).
+        let words = [
+            0xD765_0000,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0 (lane tid 0..3)
+            0x7E14_02FF,
+            (-1.0f32).to_bits(), // v_mov_b32 v10, -1.0
+            0x7E16_02FF,
+            (-1.0f32).to_bits(), // v_mov_b32 v11, -1.0
+            0x7E18_0280,         // v_mov_b32 v12, 0.0
+            0x7E1A_02F2,         // v_mov_b32 v13, 1.0
+            0x7E1E_02FF,
+            3.0f32.to_bits(), // v_mov_b32 v15, 3.0
+            0x7D84_0081,      // v_cmp_eq_u32_e32 vcc, 1, v0
+            0xD501_000A,
+            (106 << 18) | ((256 + 15) << 9) | (256 + 10), // v_cndmask_b32_e64 v10, v10, v15, vcc
+            0x7D84_0082,                                  // v_cmp_eq_u32_e32 vcc, 2, v0
+            0xD501_000B,
+            (106 << 18) | ((256 + 15) << 9) | (256 + 11), // v_cndmask_b32_e64 v11, v11, v15, vcc
+            0x7E1C_02FF,
+            (1 << 10) | (2 << 20), // v_mov_b32 v14, prim (0, 1, 2)
+            0x7D84_0080,           // v_cmp_eq_u32_e32 vcc, 0, v0
+            0xBE94_0F6A,           // s_bcnt1_i32_b32 s20, vcc_lo
+            0xBE94_0381,           // s_mov_b32 s20, 1
+            0xBF85_0003,           // s_cbranch_scc1 +3
+            0x7E02_02FF,
+            0.25f32.to_bits(), // v_mov_b32 v1, 0.25
+            0xBF82_0002,       // s_branch +2
+            0x7E02_02FF,
+            0.75f32.to_bits(), // v_mov_b32 v1, 0.75
+            0x7E04_02F2,       // v_mov_b32 v2, 1.0
+            0xF800_00CF,
+            0x0D0C_0B0A, // exp pos0, v10, v11, v12, v13
+            0xF800_020F,
+            0x0201_0101, // exp param0, v1, v1, v1, v2
+            0xF800_0941,
+            0x0E0E_0E0E, // exp prim0, v14 done
+            S_ENDPGM,
+        ];
+        let pos_sig = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let col_sig = SigElement {
+            name: "COLOR".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(1),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let rt_sig = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let ms_osg1 = signature(&[pos_sig.clone(), col_sig.clone()], false);
+        let ms_bytes = dxbc_build(&[(FourCC::OSG1, &ms_osg1)]);
+        let ms_c = Container::parse(&ms_bytes).unwrap();
+        let ms_native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 32,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![VsOutput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                }],
+                clip_cntl: 0,
+                threads: 4,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&ms_native.patched_code(), ms_native.wave64, ms_native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &ms_native.layout, ms_native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &ms_native).unwrap();
+        let lowered = lower(&Parts {
+            native: &ms_native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![pos_sig.clone(), col_sig.clone()],
+            prims: vec![],
+            mesh_stride: 4,
+        })
+        .unwrap();
+        assert!(
+            lowered.op_names.iter().any(|n| n == "dx.op.waveActiveBallot"),
+            "expected waveActiveBallot for s_bcnt1 SCC, got {:?}",
+            lowered.op_names
+        );
+        let ms = super::super::emit(&ms_c, &ms_native, &p, &st, &io, &res).unwrap();
+        validate_dxil_blob(&ms.dxil);
+
+        let ps_isg1 = signature(&[pos_sig, col_sig], true);
+        let ps_osg1 = signature(&[rt_sig], false);
+        let ps_bytes = dxbc_build(&[(FourCC::ISG1, &ps_isg1), (FourCC::OSG1, &ps_osg1)]);
+        let ps_c = Container::parse(&ps_bytes).unwrap();
+        let ps_words = [
+            0xC802_0002u32,
+            0xC806_0102,
+            0xC80A_0202,
+            0xC80E_0302,
+            0xF800_180F,
+            0x0302_0100,
+            S_ENDPGM,
+        ];
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    mask: 0xF,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let pp = ir::build(&ps_native.patched_code(), ps_native.wave64, ps_native.vgprs).unwrap();
+        let pst = structure::structure(&pp).unwrap();
+        let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).unwrap();
+        let pio = io::raise(&pp, &ps_native).unwrap();
+        let ps = super::super::emit(&ps_c, &ps_native, &pp, &pst, &pio, &pres).unwrap();
+        validate_dxil_blob(&ps.dxil);
+
+        let (root, pso) = host.mesh_pipeline(&ms, &ps).unwrap();
+        let pixels = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: vec![
+                        (0, Root::Constants(vec![0; 4])),
+                        (1, Root::Constants(vec![0; 4])),
+                    ],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (4, 4),
+                    mesh_groups: 1,
+                },
+            )
+            .expect("draw wave-uniform s_bcnt1 SCC mesh shader on WARP");
+        assert_eq!(pixels.len(), 16);
+        for (idx, px) in pixels.iter().enumerate() {
+            for (ch, want) in [0.75f32, 0.75, 0.75, 1.0].into_iter().enumerate() {
+                assert!(
+                    (px[ch] - want).abs() < 1e-4,
+                    "pixel {idx} ch {ch}: got {px:?}, expected [0.75, 0.75, 0.75, 1.0]"
+                );
+            }
+        }
+
+        // 2. Wave32 compute (32 threads): only lane 0 sets `vcc`, `s_bcnt1_i32_b32 s20, vcc_lo`,
+        // `s_cbranch_scc1` -> ALL 32 lanes must take the true branch (`37`), not just lane 0 (`9`).
+        let cs_words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+            0xBE94_0F6A, // s_bcnt1_i32_b32 s20, vcc_lo
+            0xBE94_0381, // s_mov_b32 s20, 1
+            0xBF85_0002, // s_cbranch_scc1 +2
+            0x7E02_0289, // v_mov_b32 v1, 9
+            0xBF82_0001, // s_branch +1
+            0x7E02_02A5, // v_mov_b32 v1, 37
+            0xE070_1000,
+            0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+            S_ENDPGM,
+        ];
+        let cs_native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: cs_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let cs_bytes = dxbc_build(&[]);
+        let cs_c = Container::parse(&cs_bytes).unwrap();
+        let cp = ir::build(&cs_native.code, cs_native.wave64, cs_native.vgprs).unwrap();
+        let cst = structure::structure(&cp).unwrap();
+        let cres = resource::track(&cp, &cs_native.layout, cs_native.stage, Some(&cst)).unwrap();
+        let cio = io::raise(&cp, &cs_native).unwrap();
+        let cs_lowered = lower(&Parts {
+            native: &cs_native,
+            p: &cp,
+            st: &cst,
+            io: &cio,
+            res: &cres,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert!(
+            cs_lowered.op_names.iter().any(|n| n == "dx.op.waveActiveBallot"),
+            "expected waveActiveBallot for Wave32 compute s_bcnt1 SCC, got {:?}",
+            cs_lowered.op_names
+        );
+        assert!(
+            cs_lowered
+                .insts
+                .iter()
+                .any(|l| l.starts_with("cmp:33 ") && l.ends_with(" k0")),
+            "expected wave-uniform ballot/countbits != 0 test (`cmp:33 ... k0`) for s_bcnt1 SCC, got {:?}",
+            cs_lowered.insts
+        );
+        let cs = super::super::emit(&cs_c, &cs_native, &cp, &cst, &cio, &cres).unwrap();
+        validate_dxil_blob(&cs.dxil);
+        match host.compute_pipeline(&cs) {
+            Ok((cs_root, cs_pso)) => {
+                let out = host
+                    .dispatch(
+                        &cs_root,
+                        &cs_pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            views: &[View::RawUav(32)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("dispatch Wave32 s_bcnt1 SCC compute shader");
+                assert_eq!(out[0], vec![37u32; 32]);
+            }
+            // WARP rejects fixed WaveSize compute PSOs with E_INVALIDARG.
+            Err(e) => {
+                eprintln!("Wave32 compute s_bcnt1 PSO skipped on WARP: {e}");
+            }
+        }
     }
 }

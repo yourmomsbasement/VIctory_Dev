@@ -334,6 +334,60 @@ impl Module {
         V::Func(i)
     }
 
+    /// The names of the module's declared functions.
+    #[cfg(test)]
+    pub fn func_names(&self) -> impl Iterator<Item = &str> {
+        self.funcs.iter().map(|f| f.name.as_str())
+    }
+
+    /// A line per instruction: its op and operands — `i7` an instruction,
+    /// `f2` a function, `k8` an integer constant, `undef` an undef constant,
+    /// `c1` another constant, `g3` a global.
+    #[cfg(test)]
+    pub fn inst_lines(&self) -> Vec<String> {
+        let v = |m: &Self, x: V| -> String {
+            match x {
+                V::Inst(i) => format!("i{i}"),
+                V::Func(i) => format!("f{i}"),
+                V::Global(i) => format!("g{i}"),
+                V::Const(i) => match &m.consts[i as usize].1 {
+                    Const::Int(n) => format!("k{n}"),
+                    Const::Undef => "undef".into(),
+                    _ => format!("c{i}"),
+                },
+            }
+        };
+        self.insts
+            .iter()
+            .map(|i| match &i.op {
+                Op::Bin(op, a, b) => format!("bin:{op:?} {} {}", v(self, *a), v(self, *b)),
+                Op::Cast(op, a) => format!("cast:{op:?} {}", v(self, *a)),
+                Op::Cmp(p, a, b) => format!("cmp:{p} {} {}", v(self, *a), v(self, *b)),
+                Op::Select(c, t, f) => {
+                    format!("select {} {} {}", v(self, *c), v(self, *t), v(self, *f))
+                }
+                Op::Extract(a, i) => format!("extract {} {i}", v(self, *a)),
+                Op::Phi(incoming) => {
+                    let args = incoming
+                        .iter()
+                        .map(|&(x, b)| format!("({}, b{b})", v(self, x)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("phi [{args}]")
+                }
+                Op::Call(f, args) => {
+                    let args = args
+                        .iter()
+                        .map(|&a| v(self, a))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("call f{f} [{args}]")
+                }
+                op => format!("{op:?}"),
+            })
+            .collect()
+    }
+
     /// An external global of type `ty` in address space `space` (DXIL
     /// declares thread-group shared memory this way).
     pub fn global(&mut self, name: &str, ty: Ty, space: u32) -> V {
