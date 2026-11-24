@@ -90,7 +90,7 @@ pub(crate) fn view_heap_cap(device: &ID3D12Device) -> Option<u32> {
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// below [`PORTABLE_VIEWS`].
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
@@ -154,14 +154,20 @@ impl HostHeap {
                     // out; a title that reaches them needs remapping. A
                     // shader's index past the heap reads its last slot,
                     // which no view takes (translated shaders clamp to it).
+                    // The full DYNAMIC range is kept (#1548): tables past
+                    // the title slots are made in dynamic slots, and with
+                    // only MIN_DYNAMIC of them thousands of world draws a
+                    // frame were dropped on 1M-capped hosts (#1496).
+                    let dynamic = if size > DYNAMIC * 2 { DYNAMIC } else { MIN_DYNAMIC };
                     tracing::warn!(
                         error = %e,
                         count,
                         host_limit = size,
-                        left_out = count - (size - MIN_DYNAMIC),
+                        dynamic,
+                        left_out = count - (size - dynamic),
                         "host view heap capped"
                     );
-                    (heap, size - MIN_DYNAMIC, MIN_DYNAMIC - 1, size)
+                    (heap, size - dynamic, dynamic - 1, size)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -1090,5 +1096,17 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A title heap that hits `PORTABLE_VIEWS` keeps the full `DYNAMIC`
+    /// range (`2^18` slots) rather than shrinking to `MIN_DYNAMIC`.
+    #[test]
+    fn capped_heap_keeps_full_dynamic_range() {
+        let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS) else {
+            return; // no host GPU
+        };
+        // A capped heap keeps its last slot null (clamped indices read it).
+        assert!(heap.dynamic >= DYNAMIC - 1);
+        assert!(heap.count + heap.dynamic + 1 >= PORTABLE_VIEWS);
     }
 }
