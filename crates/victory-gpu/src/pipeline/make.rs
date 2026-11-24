@@ -615,10 +615,10 @@ mod tests {
         wait(&p, frame);
         let first = started.elapsed();
         assert!(
-            first >= BUDGET / 2,
+            first >= budget() / 2,
             "the first wait spends the frame's budget: {first:?}"
         );
-        assert!(first < BUDGET + Duration::from_secs(5), "{first:?}");
+        assert!(first < budget() + Duration::from_secs(5), "{first:?}");
         let started = Instant::now();
         wait(&p, frame);
         assert!(
@@ -628,7 +628,7 @@ mod tests {
         let started = Instant::now();
         wait(&p, frame + 1);
         assert!(
-            started.elapsed() >= BUDGET / 2,
+            started.elapsed() >= budget() / 2,
             "a new frame has a full budget: {:?}",
             started.elapsed()
         );
