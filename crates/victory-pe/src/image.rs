@@ -106,15 +106,17 @@ pub struct CodeViewInfo {
 impl CodeViewInfo {
     /// The key symbol servers use: GUID (Windows byte order) + age.
     pub fn symbol_key(&self) -> String {
+        use std::fmt::Write;
         let g = &self.guid;
         let d1 = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
         let d2 = u16::from_le_bytes([g[4], g[5]]);
         let d3 = u16::from_le_bytes([g[6], g[7]]);
-        let mut s = format!("{d1:08X}{d2:04X}{d3:04X}");
+        let mut s = String::with_capacity(40);
+        let _ = write!(s, "{d1:08X}{d2:04X}{d3:04X}");
         for b in &g[8..] {
-            s.push_str(&format!("{b:02X}"));
+            let _ = write!(s, "{b:02X}");
         }
-        s.push_str(&format!("{:X}", self.age));
+        let _ = write!(s, "{:X}", self.age);
         s
     }
 }
@@ -143,7 +145,7 @@ impl ImageInfo {
             )));
         }
 
-        let sections = file
+        let sections: Vec<SectionInfo> = file
             .section_table()
             .iter()
             .map(|s| SectionInfo {
@@ -155,6 +157,31 @@ impl ImageInfo {
                 characteristics: s.characteristics.get(LE).0,
             })
             .collect();
+
+        // Validate section raw-data boundaries before accepting
+        // the PE image.
+        for section in &sections {
+            if section.file_size == 0 {
+                continue;
+            }
+
+            let start = u64::from(section.file_offset);
+            let size = u64::from(section.file_size);
+
+            let Some(end) = start.checked_add(size) else {
+                return Err(PeError::Malformed(format!(
+                    "section '{}' has invalid raw-data bounds",
+                    section.name
+                )));
+            };
+
+            if end > data.len() as u64 {
+                return Err(PeError::Malformed(format!(
+                    "section '{}' extends beyond file bounds",
+                    section.name
+                )));
+            }
+        }
 
         let dir_present = |index: usize| {
             file.data_directory(index)
@@ -380,12 +407,24 @@ fn parse_tls(
         let array = sections
             .pe_data_at(data, array_rva)
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
-        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS) {
+        let mut terminated = false;
+        for slot in array.as_chunks::<8>().0 {
             let va = u64::from_le_bytes(*slot);
             if va == 0 {
+                terminated = true;
                 break;
             }
+            if callback_rvas.len() == MAX_TLS_CALLBACKS {
+                return Err(PeError::Malformed(
+                    "TLS callback count exceeds limit".into(),
+                ));
+            }
             callback_rvas.push(va_to_rva(va, image_base)?);
+        }
+        if !terminated {
+            return Err(PeError::Malformed(
+                "unterminated TLS callback array".into(),
+            ));
         }
     }
     Ok(Some(TlsInfo {
@@ -505,6 +544,209 @@ mod tests {
         d
     }
 
+
+    fn synthetic_tls(terminated: bool) -> Vec<u8> {
+        let mut body = vec![0u8; 0x200];
+        let base = 0x1_8000_0000u64;
+        let callback_rva = if terminated {
+            0x11f0
+        } else {
+            0x11f8
+        };
+
+        body[24..32].copy_from_slice(
+            &(base + callback_rva).to_le_bytes()
+        );
+
+        let off = (callback_rva - 0x1000) as usize;
+        body[off..off + 8].copy_from_slice(
+            &(base + 0x1010).to_le_bytes()
+        );
+
+        let mut data = synthetic_image(&body);
+
+        let export = layout::data_directory_offset(
+            &data, 0
+        ).unwrap();
+        data[export..export + 8].fill(0);
+
+        let tls = layout::data_directory_offset(
+            &data, 9
+        ).unwrap();
+        data[tls..tls + 4].copy_from_slice(
+            &0x1000u32.to_le_bytes()
+        );
+        data[tls + 4..tls + 8].copy_from_slice(
+            &40u32.to_le_bytes()
+        );
+
+        data
+    }
+
+    #[test]
+    fn tls_probe_accepts_terminated_callbacks() {
+        let info = ImageInfo::parse(
+            &synthetic_tls(true)
+        ).unwrap();
+        assert_eq!(
+            info.tls.unwrap().callback_rvas,
+            vec![0x1010]
+        );
+    }
+
+    #[test]
+    fn tls_probe_rejects_unterminated_callbacks() {
+        let result = ImageInfo::parse(
+            &synthetic_tls(false)
+        );
+        assert!(
+            matches!(result, Err(PeError::Malformed(_))),
+            "Expected malformed TLS array, got {result:?}"
+        );
+    }
+
+
+    fn synthetic_tls_many(count: usize) -> Vec<u8> {
+        let mut data = synthetic_tls(true);
+        let base = 0x1_8000_0000u64;
+        let sec = 0x58 + 240;
+
+        data.resize(0x2600, 0);
+
+        for offset in [sec + 8, sec + 16] {
+            data[offset..offset + 4]
+                .copy_from_slice(&0x2400u32.to_le_bytes());
+        }
+
+        data[0x90..0x94]
+            .copy_from_slice(&0x4000u32.to_le_bytes());
+
+        data[0x218..0x220]
+            .copy_from_slice(&(base + 0x1040).to_le_bytes());
+
+        for i in 0..count {
+            let off = 0x240 + i * 8;
+            data[off..off + 8]
+                .copy_from_slice(&(base + 0x1010).to_le_bytes());
+        }
+
+        let end = 0x240 + count * 8;
+        data[end..end + 8].fill(0);
+
+        data
+    }
+
+    #[test]
+    fn tls_probe_accepts_exact_callback_limit() {
+        let info = ImageInfo::parse(
+            &synthetic_tls_many(MAX_TLS_CALLBACKS)
+        ).unwrap();
+
+        assert_eq!(
+            info.tls.unwrap().callback_rvas.len(),
+            MAX_TLS_CALLBACKS
+        );
+    }
+
+    #[test]
+    fn tls_probe_rejects_callbacks_over_limit() {
+        let data = synthetic_tls_many(MAX_TLS_CALLBACKS + 1);
+
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn tls_probe_accepts_empty_callback_list() {
+        let mut data = synthetic_tls(true);
+        data[0x3f0..0x3f8].fill(0);
+
+        let info = ImageInfo::parse(&data).unwrap();
+        assert!(info.tls.unwrap().callback_rvas.is_empty());
+    }
+
+    #[test]
+    fn tls_probe_accepts_null_callback_pointer() {
+        let mut data = synthetic_tls(true);
+        data[0x218..0x220].fill(0);
+
+        let info = ImageInfo::parse(&data).unwrap();
+        let tls = info.tls.unwrap();
+
+        assert_eq!(tls.callbacks_va, 0);
+        assert!(tls.callback_rvas.is_empty());
+    }
+
+    #[test]
+    fn rejects_section_extending_beyond_file() {
+        // Create a synthetic PE image.
+        let mut data = synthetic_image(&vec![0u8; 0x200]);
+
+        // Remove the export directory to isolate section validation.
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0);
+
+        // Verify the baseline PE is accepted.
+        assert!(
+            ImageInfo::parse(&data).is_ok(),
+            "baseline synthetic image must be valid"
+        );
+
+        // The section header starts after the 240-byte optional header.
+        let sec = opt + 240;
+
+        // Declare 4096 bytes of raw section data.
+        // The actual file contains only 1024 bytes.
+        data[sec + 16..sec + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+
+        // Investigate whether the parser rejects this malformed image.
+        assert!(
+            ImageInfo::parse(&data).is_err(),
+            "section extends beyond physical file bounds"
+        );
+    }
+
+    #[test]
+    fn accepts_section_ending_at_file_boundary() {
+        let mut data = synthetic_image(&vec![0u8; 0x200]);
+
+        // Disable the export directory to isolate section validation.
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0);
+
+        // Raw section: offset 0x200 + size 0x200 = file length 0x400.
+        let info = ImageInfo::parse(&data);
+
+        assert!(
+            info.is_ok(),
+            "section ending exactly at EOF should be accepted"
+        );
+    }
+
+    #[test]
+    fn accepts_section_with_zero_raw_size() {
+        let mut data = synthetic_image(&vec![0u8; 0x200]);
+
+        // Disable the export directory.
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0);
+
+        // Section header begins after the optional header.
+        let sec = opt + 240;
+
+        // A section may occupy virtual memory without having raw data.
+        data[sec + 16..sec + 20].copy_from_slice(&0u32.to_le_bytes());
+
+        let info = ImageInfo::parse(&data);
+
+        assert!(
+            info.is_ok(),
+            "section with zero raw size should be accepted"
+        );
+    }
+
     #[test]
     fn unused_export_slots_are_not_exports() {
         // Ordinal base 1; three address slots: "alpha", an unused hole (0),
@@ -543,5 +785,18 @@ mod tests {
                 (Some("gamma"), 3, Some(0x1204))
             ]
         );
+    }
+
+    #[test]
+    fn symbol_key_matches_pdb_convention() {
+        let cv = CodeViewInfo {
+            pdb_path: "test.pdb".into(),
+            guid: [
+                0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                0x77, 0x88,
+            ],
+            age: 1,
+        };
+        assert_eq!(cv.symbol_key(), "78563412BC9AF0DE11223344556677881");
     }
 }
