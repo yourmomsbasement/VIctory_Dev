@@ -1548,6 +1548,10 @@ impl<'a> Lower<'a> {
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
+    ///
+    /// NaN detection uses IEEE-754 bit patterns and the final selection runs
+    /// in integer space so NVIDIA's DXIL compiler cannot fold `fcmp uno` and
+    /// a float select back into `FMNMX`.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
@@ -1555,10 +1559,21 @@ impl<'a> Lower<'a> {
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
         let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
-        self.s.m.select(c, nan, least, median)
+        let abs_mask = self.s.m.i32(0x7FFF_FFFF);
+        let exp_mask = self.s.m.i32(0x7F80_0000);
+        let is_nan = |this: &mut Self, v: V| {
+            let bits = this.as_int(v);
+            let mag = this.s.m.bin(c, Bin::And, bits, abs_mask);
+            this.s.m.cmp(c, pred::IUGT, mag, exp_mask)
+        };
+        let nan_a = is_nan(self, a);
+        let nan_b = is_nan(self, b);
+        let nan_c = is_nan(self, third);
+        let nan_ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
+        let nan = self.s.m.bin(c, Bin::Or, nan_ab, nan_c);
+        let (ileast, imedian) = (self.as_int(least), self.as_int(median));
+        let picked = self.s.m.select(c, nan, ileast, imedian);
+        self.as_float(picked)
     }
 
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
