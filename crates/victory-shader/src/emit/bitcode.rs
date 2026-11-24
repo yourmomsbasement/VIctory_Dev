@@ -211,6 +211,12 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    /// Instructions emitted so far.
+    #[cfg(test)]
+    pub(crate) fn inst_count(&self) -> usize {
+        self.insts.len()
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

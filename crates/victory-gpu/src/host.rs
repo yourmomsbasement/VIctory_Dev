@@ -184,6 +184,23 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut options1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                std::ptr::from_mut(&mut options1).cast(),
+                std::mem::size_of_val(&options1) as u32,
+            )
+            .is_ok()
+            && options1.WaveLaneCountMax > 0
+        {
+            victory_shader::emit::set_host_wave_max(options1.WaveLaneCountMax);
+            tracing::info!(lanes = options1.WaveLaneCountMax, "host wave size at most");
+        }
+        if let Some(cap) = crate::descriptor::host::view_heap_cap(&device) {
+            victory_shader::emit::set_view_heap_limit(cap);
+            tracing::info!(cap, "host view heaps capped: translated shaders keep their view indices below the cap");
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

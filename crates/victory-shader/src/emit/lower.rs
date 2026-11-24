@@ -193,6 +193,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Blocks of loops lanes leave at different iterations.
+    lane_loops: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -336,6 +338,77 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
             (o.row, (o.pack2, b.map(|i| free.remove(i))))
         })
         .collect()
+}
+
+/// Blocks of loops that lanes may leave at different iterations (a branch
+/// inside the loop depends on the lane): a group barrier there is reached a
+/// different number of times by different lanes.
+fn lane_loop_blocks(st: &crate::structure::Structured) -> HashSet<usize> {
+    use crate::structure::{Atom, LaneExit};
+    let n = st.exits.len();
+    let succs = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => vec![],
+        }
+    };
+    let lane_branch = |b: usize| match st.exits[b] {
+        LaneExit::Branch { when, .. } => st
+            .bools
+            .support(when)
+            .iter()
+            .any(|a| !matches!(a, Atom::Uniform(_))),
+        _ => false,
+    };
+    let mut preds = vec![Vec::new(); n];
+    for b in 0..n {
+        for s in succs(b) {
+            if s < n {
+                preds[s].push(b);
+            }
+        }
+    }
+    // Back edges: to a block still on the depth-first stack.
+    let mut back = Vec::new();
+    let (mut state, mut stack) = (vec![0u8; n], vec![(0usize, 0usize)]);
+    if n > 0 {
+        state[0] = 1;
+    }
+    while let Some(&mut (b, ref mut next)) = stack.last_mut() {
+        let s = succs(b);
+        if let Some(&t) = s.get(*next) {
+            *next += 1;
+            if t >= n {
+                continue;
+            }
+            match state[t] {
+                0 => {
+                    state[t] = 1;
+                    stack.push((t, 0));
+                }
+                1 => back.push((b, t)),
+                _ => {}
+            }
+        } else {
+            state[b] = 2;
+            stack.pop();
+        }
+    }
+    let mut out = HashSet::new();
+    for (tail, head) in back {
+        let mut body = HashSet::from([head]);
+        let mut work = vec![tail];
+        while let Some(b) = work.pop() {
+            if body.insert(b) {
+                work.extend(preds[b].iter().copied());
+            }
+        }
+        if body.iter().any(|&b| lane_branch(b)) {
+            out.extend(body);
+        }
+    }
+    out
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -488,6 +561,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             flat: None,
             no_barrier,
+            lane_loops: lane_loop_blocks(x.st),
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -1981,6 +2055,29 @@ impl<'a> Lower<'a> {
         f
     }
 
+    /// Whether the `s_barrier` in block `b` is left without group sync (a
+    /// memory fence only). The console waits per wave, so a wave whose lanes
+    /// skip the barrier still arrives; on a host with narrower waves, lanes
+    /// of one console wave sit in several host waves, and a host wave that
+    /// never arrives hangs the GPU. That is so where lanes reach the block
+    /// on their own conditions and in loops they leave at different
+    /// iterations.
+    // shortcut: scalar branches on a `v_readfirstlane` value can still
+    // differ between host waves of one console wave (each reads its own
+    // first lane); a barrier behind one keeps its sync.
+    fn barrier_unsynced(&self, b: usize) -> bool {
+        if super::host_wave_max() >= self.wave() {
+            return false;
+        }
+        let st = self.x.st;
+        self.lane_loops.contains(&b)
+            || st
+                .bools
+                .support(st.reach[b])
+                .iter()
+                .any(|a| !matches!(a, crate::structure::Atom::Uniform(_)))
+    }
+
     /// The console wave size.
     fn wave(&self) -> u32 {
         if self.x.native.wave64 { 64 } else { 32 }
@@ -2284,6 +2381,7 @@ impl<'a> Lower<'a> {
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
                 let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                let mode = if self.barrier_unsynced(b) { mode & !1 } else { mode };
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s

@@ -62,6 +62,23 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The size of a capped view heap if `device` takes no larger
+/// shader-visible view heap (NVIDIA), else `None`. Translated shaders keep
+/// their view indices below it (`set_view_heap_limit`), and a capped heap
+/// keeps its last slot null for them.
+pub(crate) fn view_heap_cap(device: &ID3D12Device) -> Option<u32> {
+    // SAFETY: plain heap creation, released at once.
+    let larger = unsafe {
+        device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: PORTABLE_VIEWS + 1,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    };
+    larger.is_err().then_some(PORTABLE_VIEWS)
+}
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -95,24 +112,33 @@ impl HostHeap {
         };
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
-        let (heap, count, extra) = if sampler {
+        // `total`: the heap's slots, one more than title and dynamic slots
+        // in a capped heap (its last, kept null).
+        let (heap, count, extra, total) = if sampler {
             match make(count) {
-                Ok(heap) => (heap, count, 0),
+                Ok(heap) => (heap, count, 0, count),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
                 }
             }
         } else if let Ok(heap) = make(count + DYNAMIC) {
-            (heap, count, DYNAMIC)
+            (heap, count, DYNAMIC, count + DYNAMIC)
         } else {
             match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
+                Ok(heap) => (heap, count, MIN_DYNAMIC, count + MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
+                    // out; a title that reaches them needs remapping. A
+                    // shader's index past the heap reads its last slot,
+                    // which no view takes (translated shaders clamp to it).
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - MIN_DYNAMIC,
+                        MIN_DYNAMIC - 1,
+                        PORTABLE_VIEWS,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -132,7 +158,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(total) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -152,7 +178,7 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
@@ -956,6 +982,24 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A view heap the host caps keeps its last slot out of title and
+    /// dynamic slots: translated shaders clamp their indices to it.
+    #[test]
+    fn a_capped_view_heap_keeps_its_last_slot_null() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(cap) = view_heap_cap(&host.device) else {
+            return; // the host takes larger heaps
+        };
+        let Some(heap) = HostHeap::new(false, cap + 1) else {
+            return;
+        };
+        assert_eq!(heap.count + heap.dynamic, cap - 1);
+        let last = heap.dynamic(heap.dynamic).unwrap() + heap.dynamic - 1;
+        assert!(last < cap - 1);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

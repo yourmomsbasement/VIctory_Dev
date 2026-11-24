@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -77,6 +77,8 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// View heap indices stay below this ([`super::view_heap_limit`]).
+    view_limit: Option<u32>,
 }
 
 impl Shader {
@@ -128,6 +130,7 @@ impl Shader {
             lds: None,
             main,
             entry,
+            view_limit: super::view_heap_limit(),
         }
     }
 
@@ -292,6 +295,17 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        // A view index past a host heap capped below the title's (NVIDIA:
+        // 1,000,000) reads outside the heap, which hangs the GPU there; it
+        // reads the heap's last slot instead, which the host keeps null.
+        let index = match self.view_limit {
+            Some(limit) if !sampler => {
+                let last = self.m.i32(limit - 1);
+                let inside = self.m.cmp(block, pred::IULT, index, last);
+                self.m.select(block, inside, index, last)
+            }
+            _ => index,
+        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -661,5 +675,30 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Shader;
+
+    /// Emitted instructions for one heap handle at `index`.
+    fn handle_insts(limit: Option<u32>, sampler: bool) -> usize {
+        let mut s = Shader::new(false);
+        s.view_limit = limit;
+        let index = s.m.i32(1_200_000);
+        let before = s.m.inst_count();
+        let e = s.entry;
+        s.heap_handle(e, index, sampler, false, (0, 0));
+        s.m.inst_count() - before
+    }
+
+    /// Under a capped host view heap a view index is clamped (a compare
+    /// and a select before the handle); samplers and uncapped hosts are not.
+    #[test]
+    fn view_heap_indices_are_clamped_only_under_a_cap() {
+        let plain = handle_insts(None, false);
+        assert_eq!(handle_insts(Some(1_000_000), false), plain + 2);
+        assert_eq!(handle_insts(Some(1_000_000), true), handle_insts(None, true));
     }
 }
