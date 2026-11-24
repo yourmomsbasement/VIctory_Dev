@@ -2851,19 +2851,38 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+            // The host's view of a structured buffer is structured (the
+            // title's description, and the handle vector loads take): read
+            // through a raw handle it is invalid, and NVIDIA returns zeros (a
+            // count read as 0 left a loop of the world's shadow cascades
+            // running to the loop limit). With a structured stride the load
+            // takes that handle, at element address / stride, byte address %
+            // stride; a raw buffer keeps the raw handle.
+            let stride = kind.map_or(0, |u| u.stride);
+            let structured = stride >= 4 && stride.is_multiple_of(4);
+            let h = if structured {
+                self.handle(site, src, false, (12, stride))?
+            } else {
+                self.handle(site, src, false, (11, 0))?
+            };
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let al = self.s.m.i32(4);
+                let (index, within) = if structured {
+                    let s = self.s.m.i32(stride);
+                    (self.s.m.bin(c, Bin::UDiv, a, s), self.s.m.bin(c, Bin::URem, a, s))
+                } else {
+                    (a, self.s.m.undef(self.s.t.i32))
+                };
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, index, within, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
