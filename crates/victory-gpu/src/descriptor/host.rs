@@ -683,12 +683,6 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         return !typeless;
     }
     if family(view) != family(own) {
-        if crate::resource::promoted_format(view, own) {
-            if let Some(format) = format {
-                *format = d.Format;
-            }
-            return true;
-        }
         once!(view, own, "view format of another family");
         return false;
     }

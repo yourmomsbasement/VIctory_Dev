@@ -237,33 +237,6 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
-/// Whether `host_format` is a host fallback promotion for `title_format`
-/// when the host adapter rejects RTV or UAV creation on `title_format`.
-#[cfg(windows)]
-pub(crate) fn promoted_format(title_format: u32, host_format: u32) -> bool {
-    matches!((title_format, host_format), (67, 26) | (115, 87) | (86, 87))
-}
-
-/// Host render-target format matching [`host_texture`] promotion when
-/// `format` does not support RTVs on the host adapter.
-#[cfg(windows)]
-pub(crate) fn rtv_host_format(format: u32) -> u32 {
-    use windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-    let f = pc_format(format);
-    let Some(host) = crate::host::host() else {
-        return f;
-    };
-    let (s1, _) = host.format_support(f);
-    if s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 != 0 {
-        return f;
-    }
-    match f {
-        67 => 26,
-        86 | 115 => 87,
-        _ => f,
-    }
-}
-
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -844,7 +817,6 @@ fn host_texture(
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
     // copy if draws write it as a UAV.
-    const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
@@ -864,43 +836,12 @@ fn host_texture(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let mut clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
         value
     });
-    let (mut s1, _) = host.format_support(d.format);
-    let need_rtv = d.flags & RENDER_TARGET != 0
-        && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0;
-    let need_uav = d.flags & UNORDERED != 0
-        && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0;
-    let promoted = match d.format {
-        67 if need_rtv || need_uav => Some(26),
-        115 if need_rtv || need_uav => Some(87),
-        86 if need_rtv => Some(87),
-        _ => None,
-    };
-    if let Some(target) = promoted {
-        d.format = target;
-        if let Some(v) = clear_value.as_mut() {
-            v[0] = target;
-        }
-        s1 = host.format_support(target).0;
-    }
-    if d.flags & UNORDERED != 0
-        && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0
-    {
-        d.flags &= !UNORDERED;
-    }
-    if d.flags & RENDER_TARGET != 0
-        && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0
-    {
-        d.flags &= !RENDER_TARGET;
-    }
-    if d.flags & (RENDER_TARGET | DEPTH) == 0 {
-        clear_value = None;
-    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1899,33 +1840,5 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn host_texture_handles_unsupported_rtv_and_uav_formats() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU
-        };
-        let tex = |format, flags| ResourceDesc {
-            dimension: 3,
-            alignment: 0,
-            width: 64,
-            height: 64,
-            depth_or_array_size: 1,
-            mip_levels: 1,
-            format,
-            sample_count: 1,
-            sample_quality: 0,
-            layout: 0,
-            flags,
-        };
-        for (format, flags) in [(67, 5), (67, 4), (86, 5), (115, 1)] {
-            let clear = [format, 0, 0, 0, 0];
-            let res = host_texture(&tex(format, flags), 0, clear.as_ptr().cast());
-            assert!(res.is_some(), "format {format} flags {flags} failed");
-        }
-        // SAFETY: a plain device query.
-        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
