@@ -447,58 +447,144 @@ fn need(block: usize) {
 }
 
 /// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
-/// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
-/// constants and such values; or loaded from an address made of them. The compiler keeps
-/// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
-/// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
-/// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+/// written lane by lane from scalars, constants and such values, by an instruction every
+/// arriving lane runs, or one whose guard is itself made of such values; or read from LDS at
+/// an address made of them. The compiler keeps wave-uniform data in VGPRs and fetches it with
+/// `v_readfirstlane`.
+///
+/// With `threads` a one-dimensional group, `v0 >> k` (k >= 6) is the number of the thread's
+/// console wave: the same in all 64 lanes, in both host waves of 32 that run them.
+///
+/// A phi counts where every predecessor is a block all lanes run, or where the condition for
+/// reaching its block is made of such values, and every value it joins counts. Loop-carried
+/// values are first assumed to count, and the assumption is checked once the loop is through:
+/// a phi whose joined values do not all count is dropped and the pass is run again (the
+/// largest set that holds).
+/// shortcut: an LDS read is taken to see the same dword in every lane (no write between the
+/// lanes' reads); the console's barriers and wave order give that in the code it is used on.
+fn lane_uniform(
+    p: &Program,
+    st: &Structured,
+    all: &[bool],
+    threads: Option<[u32; 3]>,
+) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let mut same: HashSet<Value> = HashSet::new();
-    for b in crate::ir::reverse_postorder(&p.blocks) {
-        let block = &p.blocks[b];
-        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
-        for phi in &block.phis {
-            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
-                same.insert(phi.value);
+    let tid = match threads {
+        Some([_, 1, 1]) => p.inputs.iter().find(|i| i.0 == Reg::V(0)).map(|i| i.1),
+        _ => None,
+    };
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let uniform_bool = |same: &HashSet<Value>, b: Bool| {
+        st.bools.support(b).iter().all(|a| match *a {
+            Atom::Uniform(_) => true,
+            Atom::Lane(v) | Atom::Phi(v) => same.contains(&v),
+            _ => false,
+        })
+    };
+    // loop-carried and other phis assumed to count until shown otherwise
+    let mut assumed: HashSet<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.phis)
+        .filter(|ph| matches!(ph.reg, Reg::V(_)))
+        .map(|ph| ph.value)
+        .collect();
+    loop {
+        let mut same: HashSet<Value> = HashSet::new();
+        // grow to a fixpoint: a block's entry condition may be made of values a later block
+        // computes (a loop's back edge)
+        loop {
+            let before = same.len();
+            for &b in &order {
+                let block = &p.blocks[b];
+                let entered = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false))
+                    || st.reach.get(b).is_some_and(|&r| uniform_bool(&same, r));
+                for phi in &block.phis {
+                    if matches!(phi.reg, Reg::V(_))
+                        && entered
+                        && phi
+                            .args
+                            .iter()
+                            .all(|a| same.contains(a) || assumed.contains(&phi.value))
+                    {
+                        same.insert(phi.value);
+                    }
+                }
+                for (i, inst) in block.insts.iter().enumerate() {
+                    let name = inst.name();
+                    if let Some(g) = st.guards[b][i]
+                        && !uniform_bool(&same, g)
+                    {
+                        continue; // lanes outside EXEC keep another value
+                    }
+                    // the console wave's number
+                    if let (Some(t), Fields::Valu(v)) = (tid, &inst.fields)
+                        && name == "v_lshrrev_b32"
+                        && matches!(v.src.first(), Some(&Operand::Const(c)) if (134..=159).contains(&c))
+                        && inst.reads.iter().any(|r| r.0 == Reg::V(0) && r.1 == t)
+                    {
+                        same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+                        continue;
+                    }
+                    let ops: Vec<Operand> = match &inst.fields {
+                        Fields::Valu(v)
+                            if v.dpp.is_none()
+                                && v.sdwa.is_none()
+                                && !name.starts_with("v_mbcnt")
+                                && !name.contains("lane") =>
+                        {
+                            v.src.clone()
+                        }
+                        // LDS read at an address every lane shares
+                        Fields::Ds { addr: Some(a), gds: false, .. }
+                            if name.starts_with("ds_read") && !name.contains("addtid") =>
+                        {
+                            vec![*a]
+                        }
+                        _ => continue,
+                    };
+                    let alike = ops.iter().all(|op| match *op {
+                        Operand::Vector { reg, .. } => {
+                            // every dword of the operand the instruction reads from that register on
+                            let read: Vec<Value> = inst
+                                .reads
+                                .iter()
+                                .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
+                                .map(|r| r.1)
+                                .collect();
+                            !read.is_empty() && read.iter().all(|x| same.contains(x))
+                        }
+                        // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                        Operand::Scalar { code, .. } if code != NULL => {
+                            inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
+                        }
+                        _ => true,
+                    });
+                    if alike {
+                        same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+                    }
+                }
+            }
+            if same.len() == before {
+                break;
             }
         }
-        for (i, inst) in block.insts.iter().enumerate() {
-            let name = inst.name();
-            let ops: Vec<Operand> = match &inst.fields {
-                Fields::Valu(v)
-                    if v.dpp.is_none()
-                        && v.sdwa.is_none()
-                        && !name.starts_with("v_mbcnt")
-                        && !name.starts_with("v_cmpx")
-                        && !name.contains("lane") =>
-                {
-                    v.src.clone()
-                }
-                _ => continue,
-            };
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
-            }
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
-                    !read.is_empty() && read.iter().all(|x| same.contains(x))
-                }
-                // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => {
-                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
-                }
-                _ => true,
-            });
-            if alike {
-                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
-            }
+        // check the assumption: a phi counts only if every value it joins does
+        let wrong: Vec<Value> = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.phis)
+            .filter(|ph| assumed.contains(&ph.value))
+            .filter(|ph| !same.contains(&ph.value) || ph.args.iter().any(|a| !same.contains(a)))
+            .map(|ph| ph.value)
+            .collect();
+        if wrong.is_empty() {
+            return same;
+        }
+        for v in wrong {
+            assumed.remove(&v);
         }
     }
-    same
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1235,6 +1321,10 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        let group_threads = match x.native.io {
+            StageIo::Cs(cs) => Some(cs.threads),
+            _ => None,
+        };
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -1523,7 +1613,7 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, group_threads),
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
