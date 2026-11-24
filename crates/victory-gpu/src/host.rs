@@ -543,19 +543,14 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        // Submit each title list (with its prelude) in its own ExecuteCommandLists
+        // + fence wait so heavy 30+ list world submissions do not sum past
+        // Windows' ~2 s TDR timeout and trigger DXGI_ERROR_DEVICE_HUNG (0x887A0006).
+        let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
+            .iter()
+            .zip(firsts.iter().skip(1).chain([&lists.len()]))
+            .map(|(&a, &b)| &lists[a..b])
+            .collect();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -574,7 +569,7 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -584,8 +579,11 @@ impl Host {
                 }
             }
             let _ = (i, started);
+            // SAFETY: a plain query.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                break;
+            }
         }
-        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
