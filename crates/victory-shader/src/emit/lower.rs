@@ -179,6 +179,8 @@ fn half_shift(width: u32) -> u32 {
 
 struct Lower<'a> {
     s: Shader,
+    #[cfg(feature = "diagnostics")]
+    material_tag: Option<[u8; 3]>,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
@@ -1559,6 +1561,12 @@ impl<'a> Lower<'a> {
         }
         Lower {
             s,
+            #[cfg(feature = "diagnostics")]
+            material_tag: if x.outputs.iter().any(|e| e.kind == 16 && e.row == Some(3)) {
+                super::material_tag(x.native)
+            } else {
+                None
+            },
             x,
             bad,
             lane_fail: HashMap::new(),
@@ -10652,6 +10660,9 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            #[cfg(feature = "diagnostics")]
+            let material_channel = (el.kind == 16 && el.row == Some(0) && el.comp == 9)
+                .then_some(usize::from(el.col + col));
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
@@ -10662,6 +10673,13 @@ impl<'a> Lower<'a> {
                     (".f32", f)
                 }
                 _ => (".i32", x),
+            };
+            // Preserve coverage, depth, alpha and other material outputs.
+            #[cfg(feature = "diagnostics")]
+            let x = match (self.material_tag, material_channel) {
+                (Some(rgb), Some(channel @ 0..3)) =>
+                    self.s.m.f32((f32::from(rgb[channel]) / 255.0).to_bits()),
+                _ => x,
             };
             let mut args = vec![
                 self.s.m.i32(id as u32),

@@ -21,7 +21,7 @@ tempfile.workspace = true
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
-diagnostics = []
+diagnostics = ["victory-shader/diagnostics"]
 
 [lints]
 workspace = true

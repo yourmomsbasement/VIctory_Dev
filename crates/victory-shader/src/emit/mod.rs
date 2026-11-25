@@ -264,6 +264,23 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// RGB identifier for a pixel program in a diagnostic material capture.
+/// Identical native code gets the same color across pipeline compilations.
+#[cfg(feature = "diagnostics")]
+pub fn material_tag(native: &NativeProgram) -> Option<[u8; 3]> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if native.stage != HwStage::Ps
+        || !ENABLED.get_or_init(|| std::env::var("VICTORY_MATERIAL_IDS").as_deref() == Ok("1"))
+    {
+        return None;
+    }
+    let hash = native.code.iter().fold(0x811c9dc5_u32, |h, &byte| {
+        (h ^ u32::from(byte)).wrapping_mul(0x01000193)
+    });
+    let [r, g, b, _] = hash.to_le_bytes();
+    Some([r, g, b])
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,

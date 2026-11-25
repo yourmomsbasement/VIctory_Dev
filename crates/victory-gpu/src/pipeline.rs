@@ -183,6 +183,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
+    #[cfg(feature = "diagnostics")]
+    if let Some(rgb) = programs.iter().find_map(victory_shader::emit::material_tag) {
+        let hash = blake3::hash(container).to_hex();
+        tracing::info!(shader = &hash[..16], ?rgb, "material capture color");
+    }
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()
