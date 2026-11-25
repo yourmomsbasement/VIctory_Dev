@@ -48,6 +48,12 @@ pub(crate) struct HostHeap {
     /// dwords: the byte stride (zero for no buffer) and the encoded raw
     /// alias. Mapped at the address kept beside it.
     strides: Option<(ID3D12Resource, usize)>,
+    /// View heaps: the view-mark table translated shaders read
+    /// (`victory_shader::emit`, "Write marks"), two dwords per physical
+    /// slot: the mark bit and phase of the unordered buffer
+    /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
+    /// beside it.
+    marks: Option<(ID3D12Resource, usize)>,
     /// Per title slot, the title address of the buffer view it holds, as a
     /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
     /// address as data, `crate::memory`): the buffer, its mapping and host
@@ -119,6 +125,17 @@ impl HostHeap {
             .then(|| host.upload_buffer(u64::from(views) * 8))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
+        let marks = (!sampler)
+            .then(|| {
+                let bytes = u64::from(views) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                crate::host::name(&buffer, || "view marks".into());
+                // Every slot unmarked (all ones) until a view is made there.
+                // SAFETY: our mapped buffer of `bytes` bytes.
+                unsafe { std::ptr::write_bytes(data, 0xFF, bytes as usize) };
+                Some((buffer, data as usize))
+            })
+            .flatten();
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         // View-heap bounds in the translated shader match this allocation.
@@ -176,6 +193,7 @@ impl HostHeap {
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: if sampler { total } else { views - 3 },
             strides,
+            marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
         };
@@ -358,12 +376,13 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let (kept, mark) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
         self.set_stride(index, Some(view));
+        self.set_mark(index, mark);
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -420,6 +439,7 @@ impl HostHeap {
         }
         self.keep(index, buffer.map(|b| (b.clone(), None)));
         self.write_stride(index, 4);
+        self.set_mark(index, None);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -432,6 +452,7 @@ impl HostHeap {
         }
         self.keep(index, None);
         self.set_stride(index, None);
+        self.set_mark(index, None);
         if index < self.count {
             self.viewed.set(index, None, false);
         }
@@ -497,6 +518,9 @@ impl HostHeap {
                 std::collections::hash_map::Entry::Vacant(e) => *e.insert(self.pair()?),
             };
             self.raw_view_at(pair, unordered.then_some(buffer), offset - bias, len + bias, true);
+            if unordered {
+                self.set_mark(pair, shadow.mark_entry(address - bias));
+            }
             self.raw_view_at(pair + 1, Some(buffer), offset - bias, len + bias, false);
             Some(((pair + 1) << 4) | bias as u32)
         })();
@@ -510,6 +534,29 @@ impl HostHeap {
     /// The view-stride table, for root SRV `VIEW_STRIDES`.
     pub(crate) fn strides(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|(buffer, _)| buffer)
+    }
+
+    /// Enters slot `index`'s view-mark entry: the mark bit and phase of the
+    /// unordered buffer view there ([`crate::shadow::Shadow::mark_entry`]),
+    /// none for anything else.
+    pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
+        let Some((_, data)) = &self.marks else { return };
+        if index >= self.slots {
+            return;
+        }
+        let entry = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
+        // SAFETY: two dwords of the mapped table, which has two per slot
+        // in the physical view heap.
+        unsafe {
+            let at = (*data as *mut u32).add(2 * index as usize);
+            at.write_volatile(entry.0);
+            at.add(1).write_volatile(entry.1);
+        }
+    }
+
+    /// The view-mark table, for the root SRV of shaders marking their writes.
+    pub(crate) fn marks(&self) -> Option<&ID3D12Resource> {
+        self.marks.as_ref().map(|(buffer, _)| buffer)
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -608,6 +655,9 @@ impl HostHeap {
         self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
         self.write_stride(index, 4);
         self.write_stride(index + 1, 4);
+        // Writes through these are title memory's, marked in its page table.
+        self.set_mark(index, None);
+        self.set_mark(index + 1, None);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -670,11 +720,12 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
+            let (kept, mark) = if later {
+                (None, None)
             } else {
-                make(&view, self.cpu(index))
+                make_marked(&view, self.cpu(index))
             };
+            self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -978,7 +1029,23 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
+    MARK.with(|m| m.set(shadow.mark_entry(start)));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+}
+
+thread_local! {
+    /// The view-mark entry of the unordered buffer view [`make`] last made
+    /// on this thread ([`make_marked`]).
+    static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`make`], and the view-mark entry of the view if it is an unordered
+/// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
+/// marks").
+fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+    MARK.with(|m| m.set(None));
+    let kept = make(view, at);
+    (kept, MARK.with(std::cell::Cell::take))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1489,6 +1556,26 @@ mod tests {
             assert!((heap.count + heap.dynamic..heap.pairs_end).contains(&(alias >> 4)));
             assert_eq!(*pair.get_or_insert(alias >> 4), alias >> 4);
         }
+        // A UAV alias starts at the preceding 16-byte boundary.
+        // Its marks must describe that base, including the leading bytes.
+        let mut uav = [0; 16];
+        uav[1] = 1;
+        uav[2] = 2; // first element at byte 24
+        uav[4] = 2;
+        uav[5] = 12;
+        uav[10..12].copy_from_slice(&desc[10..12]);
+        let view = View::Placed(true, resource, uav);
+        let (kept, mark) = make_marked(&view, heap.cpu(0));
+        let kept = kept.unwrap();
+        heap.indexed_buffer_info(0, &view, &kept);
+        heap.keep(0, kept);
+        let [_, encoded] = record();
+        let (base, phase) = mark.expect("tracked view has a write mark");
+        let (_, data) = heap.marks.as_ref().unwrap();
+        // SAFETY: the encoded SRV slot has its paired UAV immediately below.
+        let alias_mark = unsafe { (*data as *const [u32; 2]).add(((encoded >> 4) - 1) as usize).read_volatile() };
+        assert_eq!(encoded & 15, 8);
+        assert_eq!(alias_mark, [base, phase - 8]);
         heap.make_null(0);
         assert_eq!(record(), [0, 0]);
         assert_eq!(heap.pair(), pair.map(|srv| srv - 1));
