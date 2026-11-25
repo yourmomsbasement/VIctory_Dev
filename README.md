@@ -8,27 +8,33 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-24)
+## Status (2026-11-25)
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps,
-loads the world and shows it: slowly, and with rendering defects.
+**Not playable yet, but you can get into the game.** The title boots, runs
+its menus at its own 30 fps, loads the world, plays the intro cutscene and
+reaches the **prologue**, the mission after it, with the graphics fully
+displayed, at about **1 frame per second**.
 
 | Stage | State |
 |-------|-------|
 | Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
 | Intro video with sound | works |
 | Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
+| Loading into the world (about a minute) | works |
+| The intro cutscene | plays at about 1 fps (0.9-1.0 s a frame, warm cache, quiet machine): textured and lit characters with whole hair, buildings, sky, depth of field, the title card, credits and interface. Missing: ray-traced shadows and indirect light, the local-light shadow mask. Seen in some shots: a pink band over nearer bodies, a stand-in head on a secondary character for a few frames |
+| The prologue | reached; the graphics are fully displayed, at about 1 fps |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+In the intro cutscene at 1 fps the opening credits land over other shots than
+on a console: they follow the frame count, the shots follow the clock.
 
-> **Warning.** Entering the world on a real GPU has hung it in earlier
-> builds, and Windows then resets the display driver (every monitor goes
-> black for a moment). The latest runs did not, but it is not ruled out; a
-> run can also end on a GPU fault (`crashes.log`). A diagnostics build with
-> `VICTORY_D3D12_WARP=1` renders on the software adapter instead (too slow
-> to reach the world in minutes).
+Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
+
+> **Warning.** Entering the world on a real GPU hung it in earlier builds,
+> and Windows then reset the display driver (every monitor goes black for a
+> moment). The latest runs, several minutes each in the world, did not, but
+> it is not ruled out; a run can also end on a GPU fault (`crashes.log`). A
+> diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
+> adapter instead (too slow to reach the world in minutes).
 
 What each part does today and what it still needs:
 
@@ -41,10 +47,10 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
+| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
+| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: all but under 300 of 24,387 programs | Merged geometry stages (195 programs) and under 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
+| Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
 
 ## Getting started
 
@@ -58,10 +64,11 @@ repository then fetches the pinned toolchain. Building needs the MSVC C++
 build tools: Visual Studio or its Build Tools with the "Desktop development
 with C++" workload.
 
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+A run in the world takes about 33 GB of Windows commit (RAM plus paging
+file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
+and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
+Performance → Memory**. If `crashes.log` reports Windows error 1455, close
+other applications or increase the Windows paging file size, then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
@@ -84,10 +91,17 @@ translator) translates every shader the title can ask for into the cache
 they are translated at first use, and their draws wait. With `--pipelines`
 it then makes every pipeline in the title's shader pack (inside
 `shaders.rpf`) into the host pipeline library (about 27,000 pipelines, 4 MB;
-some 20 minutes on 16 threads, most of it the 2,700 compute ones), so a run
+estimated at 20 minutes on 16 threads, but about 2 pipelines a second after a
+translator change that touches most programs, which is hours), so a run
 compiles none of those either; the library belongs to the GPU and driver it
 was made on. Run again, it skips what is there in seconds; stopped
-early, it keeps what it made.
+early, it keeps what it made. Without it, a run makes the pipelines it needs
+on worker threads and keeps them, so the first runs after a translator
+change are slower and show missing draws for a while.
+
+To get into the game, press A (Enter) on each first-boot screen and again on
+the start screen. Loading the world takes about a minute; the intro cutscene
+plays, then the prologue starts.
 
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
