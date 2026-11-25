@@ -20,6 +20,10 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// `skip`: the branch past the body when no thread is below s0: `s_cbranch_execz`, or
 /// `s_cbranch_scc0` on the SCC `s_and_saveexec` sets ("some lane is left").
 fn program(skip: u32) -> NativeProgram {
+    wave_or_program(skip, false)
+}
+
+fn wave_or_program(skip: u32, indexed_output: bool) -> NativeProgram {
     let mut words = vec![
         0x7E0A_0281, // v_mov_b32 v5, 1
         0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
@@ -35,7 +39,63 @@ fn program(skip: u32) -> NativeProgram {
         0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
     ]);
-    native(&words)
+    if indexed_output {
+        // Flatten the 8x16 group and preserve the output address before v0 is overwritten.
+        words.splice(..0, [
+            0xD746_0000, 0x0401_0701, // v_lshl_add_u32 v0, v1, 3, v0
+            0x3410_0082,              // v_lshlrev_b32 v8, 2, v0
+        ]);
+        let store = words.len() - 3;
+        words[store] |= 1 << 12; // offen
+        words[store + 1] |= 8;   // vaddr = v8
+    }
+    let mut result = native(&words);
+    if indexed_output && let StageIo::Cs(cs) = &mut result.io {
+        cs.threads = [8, 16, 1];
+        cs.rsrc2 |= 1 << 11; // v0 = x, v1 = y
+    }
+    result
+}
+
+#[test]
+fn independent_console_waves_preserve_thread_ids_and_wave_wide_decisions() {
+    let native = wave_or_program(0xBF88_0000, true);
+    let p = ir::build(&native.code, true, native.vgprs).unwrap();
+    let b = p.blocks.iter().position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")).unwrap();
+    let shader = lowered(&native, &p, &HashSet::from([b])).unwrap();
+    if let Ok(mut validator) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        validator.validate(&mut shader.dxil.clone()).unwrap();
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    if host.wave_lanes().is_none_or(|(min, max)| min > 32 || max < 32) { return }
+    let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+    let mut ud = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 0) { ud[u.index as usize] = 97; }
+    }
+    let out = host.dispatch(&root, &pipeline, &Dispatch {
+        roots: vec![(0, Root::Constants(ud))],
+        views: &[View::RawUav(128)], samplers: &[], groups: [1, 1, 1],
+    }).unwrap();
+    assert_eq!(&out[0][..64], &[u32::MAX; 64]);
+    assert_eq!(&out[0][64..97], &[0x1ffff; 33]);
+    assert_eq!(&out[0][97..], &[0; 31]);
+    eprintln!("verified both console waves and all 128 thread outputs on the GPU");
+}
+
+#[test]
+fn serial_waves_require_complete_independent_waves() {
+    let independent = |words: &[u32], threads, shared| {
+        let native = native_of(words, true, threads);
+        let StageIo::Cs(mut cs) = native.io else { unreachable!() };
+        if shared { cs.rsrc2 |= 1 << 15; }
+        lower::independent_waves(&ir::build(&native.code, true, native.vgprs).unwrap(), cs)
+    };
+    assert!(independent(&[], 128, false));
+    assert!(!independent(&[], 96, false));
+    assert!(!independent(&[], 128, true));
+    assert!(!independent(&[0xbf8a0000], 128, false)); // s_barrier
 }
 
 /// A wave64 compute program of 64 threads (one console wave; the thread index in v0) with 4

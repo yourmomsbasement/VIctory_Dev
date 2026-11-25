@@ -271,6 +271,8 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// Starting guest thread and common exit of the wave currently being run.
+    serial_wave: Option<(V, usize)>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1317,6 +1319,20 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// A group of complete waves with no communication through group memory,
+/// barriers or atomics. A single physical group can run its waves in order.
+pub(super) fn independent_waves(p: &Program, cs: crate::native::ComputeIo) -> bool {
+    let threads = cs.threads.into_iter().try_fold(1u32, u32::checked_mul);
+    matches!(threads, Some(n) if n > 64 && n <= 1024 && n % 64 == 0)
+        && cs.lds_bytes() == 0
+        && p.blocks.iter().flat_map(|b| &b.insts).all(|i| {
+            let n = i.name();
+            !matches!(i.fields, Fields::Ds { .. })
+                && !n.contains("atomic") && !n.starts_with("s_barrier")
+                && !n.starts_with("s_sendmsg") && !n.starts_with("s_sleep")
+        })
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1625,6 +1641,7 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             wave_base: None,
+            serial_wave: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -2147,6 +2164,37 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        if let StageIo::Cs(cs) = self.x.native.io
+            && self.exchange.is_some() && !self.local && !self.x.st.wide.is_empty()
+            && independent_waves(p, cs)
+        {
+            // Group IDs and dispatch dimensions stay intact. All host threads
+            // evaluate the same logical wave, including its control decisions.
+            let first = self.s.entry;
+            let header = self.s.m.new_block();
+            let body = self.s.m.new_block();
+            let latch = self.s.m.new_block();
+            let done = self.s.m.new_block();
+            // Assign physical half-wave numbers once for the whole dispatch.
+            self.wave_base();
+            // Lanes may leave the guest through different blocks. Everyone
+            // finishes this wave before the next wave reuses exchange memory.
+            self.group_sync(latch);
+            let base = self.s.m.phi(header, self.s.t.i32);
+            let zero = self.s.m.i32(0);
+            let stride = self.s.m.i32(64);
+            let end = self.s.m.i32(cs.threads.iter().product());
+            let next = self.s.m.bin(latch, Bin::Add, base, stride);
+            let more = self.s.m.cmp(latch, pred::IULT, next, end);
+            self.s.m.terminate(first, Term::Br(header));
+            self.s.m.set_phi(base, vec![(zero, first), (next, latch)]);
+            self.s.m.terminate(header, Term::Br(body));
+            self.s.m.terminate(latch, Term::CondBr(more, header, done));
+            self.s.m.terminate(done, Term::Ret);
+            self.s.threads = Some([64, 1, 1]);
+            self.s.entry = body;
+            self.serial_wave = Some((base, latch));
+        }
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -4153,11 +4201,16 @@ impl<'a> Lower<'a> {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let StageIo::Cs(cs) = self.x.native.io else { unreachable!("compute thread id") };
+        let [x, y, _] = cs.threads;
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         if self.halves.is_some() {
             let f = self.console_thread();
+            let f = match self.serial_wave {
+                Some((base, _)) => self.s.m.bin(e, Bin::Add, base, f),
+                None => f,
+            };
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
             return Val::I32(match c {
@@ -10987,7 +11040,7 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
-                Term::Ret
+                self.serial_wave.map_or(Term::Ret, |(_, latch)| Term::Br(latch))
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
@@ -11050,7 +11103,7 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        self.s.m.terminate(a, self.serial_wave.map_or(Term::Ret, |(_, latch)| Term::Br(latch)));
         self.abort = Some(a);
         a
     }

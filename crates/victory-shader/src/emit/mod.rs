@@ -380,7 +380,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = wide_wave64(c);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -497,13 +497,23 @@ pub fn emit(
     emit_with_interps(&p, &st, &io, &res).map(|(shader, _)| shader)
 }
 
+/// Select the wave64 fallback globally or for individual DXBC digests.
+fn wide_wave64(c: &Container) -> bool {
+    std::env::var("VICTORY_WAVE_WIDE").is_ok_and(|setting| {
+        setting == "1" || setting.split(',').map(str::trim).any(|s| {
+            s.len() == 32 && u128::from_str_radix(s, 16) == Ok(u128::from_be_bytes(c.digest))
+        })
+    })
+}
+
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
 /// it translates or a branch cannot be widened. Only where a thread group is one console
 /// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// such a branch would wait for threads that never come. For independent
+/// waves the lowering instead runs each guest wave in turn on one host group.
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -518,6 +528,7 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs) if wide_wave64(c) && lower::independent_waves(p, cs) => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

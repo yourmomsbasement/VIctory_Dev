@@ -367,6 +367,26 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Record the first command of each kind reached by a selected compute
+/// pipeline, including early binding/indirect failures before Dispatch.
+#[cfg(feature = "diagnostics")]
+fn trace_dispatch(p: &HostPipeline, event: &str) {
+    static SELECTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static SEEN: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+    let selected = SELECTED.get_or_init(|| std::env::var("VICTORY_TRACE_DISPATCH")
+        .unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect());
+    if selected.is_empty() || !p.compute { return }
+    for stage in &p.stages {
+        let hash = &stage.shader.hash;
+        if !selected.contains(hash) { continue }
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.iter().any(|(s, e)| s == hash && e == event) {
+            seen.push((hash.clone(), event.to_owned()));
+            tracing::info!(shader = %hash, frame = crate::queue::presented() + 1, event, "compute command");
+        }
+    }
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -1765,6 +1785,8 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
+            #[cfg(feature = "diagnostics")]
+            trace_dispatch(p, "direct bindings failed");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -1777,6 +1799,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        trace_dispatch(p, "recorded Dispatch");
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2479,15 +2503,18 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
+        #[cfg(feature = "diagnostics")]
+        let why = |what: &str| {
+            trace_dispatch(p, what);
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let why = |_: &str| {};
         // Indirect rectangles (Grand Theft Auto VI's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
@@ -2660,6 +2687,8 @@ impl State {
         }
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
+            #[cfg(feature = "diagnostics")]
+            trace_dispatch(p, "recorded ExecuteIndirect");
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
