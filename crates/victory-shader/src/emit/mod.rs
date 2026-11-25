@@ -1570,6 +1570,24 @@ mod barycentric_tests {
         }
     }
 
+    #[test]
+    fn packed_signature_elements_keep_their_order_and_share_a_mode() {
+        let mut elements = [
+            SigElement { col: 3, cols: 1, interp: 2, ..element("TEXCOORD", 0, 9) },
+            SigElement { col: 0, cols: 1, comp: 5, interp: 1, ..element("COLOR", 0, 9) },
+        ];
+        container::same_mode_per_row(&mut elements, false);
+        assert_eq!(elements[0].interp, 1);
+        let signature = container::signature(&elements, false);
+        // The component masks are in byte 24 of each serialized element.
+        assert_eq!([signature[8 + 24], signature[8 + 32 + 24]], [8, 1]);
+
+        elements[0].usage = 1;
+        elements[0].interp = 2;
+        container::same_mode_per_row(&mut elements, true);
+        assert_eq!(elements[0].interp, 2, "preserve explicit pixel interpolation");
+    }
+
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
