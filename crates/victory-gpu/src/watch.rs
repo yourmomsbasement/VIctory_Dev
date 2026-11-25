@@ -474,13 +474,19 @@ struct Guards {
     clean: BTreeSet<usize>,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
-    absent: BTreeSet<usize>,
+    /// With the frame they were last found so: a block found absent in a
+    /// placeholder is not asked about again in that frame ([`absent_every`]).
+    absent: BTreeMap<usize, u64>,
+    /// The runtime's placeholder reservations (first block -> end block),
+    /// which only its mappings fill ([`title_memory_placeholder`]).
+    placeholders: BTreeMap<usize, usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
-    absent: BTreeSet::new(),
+    absent: BTreeMap::new(),
+    placeholders: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -502,7 +508,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
         let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
+        g.protected.contains(&first) || g.absent.contains_key(&first)
     };
     if !known && !is_view(start, end) {
         return None;
@@ -524,21 +530,32 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
+    let frame = crate::frame::current();
+    let every = absent_every();
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
         let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
-            }
-            open = block >= uncommitted_until;
-            if open {
-                g.absent.remove(&block);
+        if open && let Some(&seen) = g.absent.get(&block) {
+            if seen == frame && !every && in_placeholder(&g.placeholders, block) {
+                // Found absent in this frame already, in a placeholder: only
+                // the runtime's mappings fill one, and they say so
+                // ([`title_memory_remapped`]).
+                open = false;
+            } else {
+                // Ordinary commits need no runtime mapping notification. Reuse
+                // this asking's query for the following blocks in the same region.
+                if block >= uncommitted_until {
+                    uncommitted_until = uncommitted_end(block);
+                }
+                open = block >= uncommitted_until;
+                if open {
+                    g.absent.remove(&block);
+                } else {
+                    g.absent.insert(block, frame);
+                }
             }
         }
         if open {
@@ -556,6 +573,43 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
+}
+
+/// Whether a block found absent in a placeholder is asked about again at
+/// every refresh (`VICTORY_GUARD_ABSENT_EVERY=1`), not once a frame.
+///
+/// The title's page pool is a placeholder that the runtime maps views into
+/// block by block. An unmapped block stays a placeholder of its own, so one
+/// query sees one block: a refresh over 174 MB of them cost 977 microseconds
+/// (7 for a mapped, clean view of that size), and a world frame refreshes
+/// such ranges 17 times. Nothing but a mapping (`MEM_REPLACE_PLACEHOLDER`,
+/// the runtime's, which it tells of: [`title_memory_remapped`]) puts memory
+/// in a placeholder; a block of an ordinary reservation can be committed
+/// without a word, and is asked about every time as before.
+/// shortcut: once a frame, not never: the title frees its reservations with
+/// the host's `VirtualFree`, which says nothing, and the addresses of a freed
+/// placeholder could be reserved and committed again.
+fn absent_every() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ABSENT_EVERY").is_some_and(|v| v == "1"))
+}
+
+/// Whether `block` lies in a placeholder reservation of the runtime's.
+fn in_placeholder(placeholders: &BTreeMap<usize, usize>, block: usize) -> bool {
+    placeholders.range(..=block).next_back().is_some_and(|(_, &end)| block < end)
+}
+
+/// The runtime reserved `[at, at + len)` as a placeholder
+/// (`XMemVirtualAlloc` of 64 KiB pages, filled by `XMemMapPhysicalPages`).
+pub fn title_memory_placeholder(at: usize, len: usize) {
+    let mut g = guards();
+    let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    // (a reservation made again where an old one was replaces it)
+    let stale: Vec<usize> = g.placeholders.range(first..end).map(|(&b, _)| b).collect();
+    for b in stale {
+        g.placeholders.remove(&b);
+    }
+    g.placeholders.insert(first, end);
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -631,7 +685,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
+            g.absent.insert(block, crate::frame::current());
         }
     }
 }
@@ -815,7 +869,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
+    let absent: Vec<usize> = g.absent.range(range.clone()).map(|(&block, _)| block).collect();
     for block in absent {
         g.absent.remove(&block);
     }
@@ -886,6 +940,122 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Cost of the guards on a view as big as the title's 174 MB heap, which
+    /// a world frame refreshes 17 times (412 guard faults a frame in all):
+    /// a refresh with nothing written, one after 24 blocks were written, and
+    /// a guard fault. `cargo test -p victory-gpu --release guard_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn guard_cost_on_a_heap_sized_view() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, SEC_COMMIT};
+        const SIZE: usize = 0xae0_0000;
+        const BLOCKS: usize = SIZE / BLOCK;
+        // SAFETY: a fresh committed section and one writable view of it, kept
+        // for the test process (the guard state is shared).
+        let section = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, SIZE as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        // SAFETY: as above.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE) };
+        let at = view.Value as usize;
+        assert_ne!(at, 0);
+        title_memory_remapped(at, SIZE);
+        crate::title_memory_view(at, SIZE, section as usize, 0);
+        let refresh = || guard(at, at + SIZE).expect("a view");
+        assert_eq!(refresh().len(), SIZE / PAGE, "first refresh takes every block");
+        let time = |f: &mut dyn FnMut()| {
+            let started = std::time::Instant::now();
+            f();
+            started.elapsed().as_secs_f64() * 1e6
+        };
+        const ROUNDS: usize = 200;
+        let clean: f64 = (0..ROUNDS).map(|_| time(&mut || assert!(refresh().is_empty()))).sum::<f64>() / ROUNDS as f64;
+        let mut seed = 0x9E37_79B9u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as usize) % BLOCKS
+        };
+        let (mut faults, mut dirty, mut written) = (0.0, 0.0, 0usize);
+        for _ in 0..ROUNDS {
+            let blocks: Vec<usize> = (0..24).map(|_| next()).collect();
+            faults += time(&mut || {
+                for &b in &blocks {
+                    // SAFETY: inside the view; the first write to a guarded
+                    // block faults and the handler opens it.
+                    unsafe { ((at + b * BLOCK + 64) as *mut u32).write_volatile(b as u32) };
+                }
+            });
+            dirty += time(&mut || written += refresh().len());
+        }
+        eprintln!(
+            "GUARD-COST {} MB view: clean refresh {clean:.1} us; refresh after 24 written blocks {:.1} us ({:.1} blocks found); \
+             a guard fault {:.2} us",
+            SIZE >> 20,
+            dirty / ROUNDS as f64,
+            written as f64 / ROUNDS as f64 / (BLOCK / PAGE) as f64,
+            faults / (ROUNDS * 24) as f64,
+        );
+
+        // The title's page pool: a placeholder the runtime maps views into
+        // block by block, left as one 64 KiB placeholder per block once they
+        // are unmapped. Here every block is such a placeholder, none mapped.
+        use windows_sys::Win32::System::Memory::{VirtualAlloc2, VirtualFree};
+        const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
+        const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
+        const PAGE_NOACCESS: u32 = 0x01;
+        // SAFETY: a fresh placeholder of ours, split in place, kept.
+        let pool = unsafe {
+            VirtualAlloc2(0 as _, std::ptr::null(), SIZE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+        } as usize;
+        assert_ne!(pool, 0);
+        for b in 0..BLOCKS - 1 {
+            // SAFETY: splits the placeholder at a block boundary.
+            let ok = unsafe { VirtualFree((pool + b * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+            assert_ne!(ok, 0, "split at block {b}");
+        }
+        title_memory_placeholder(pool, SIZE);
+        let pool_refresh = || guard(pool, pool + SIZE).expect("unmapped placeholders count as a view");
+        let _ = pool_refresh(); // every block, the first time
+        let absent: f64 = (0..20).map(|_| time(&mut || assert!(pool_refresh().is_empty()))).sum::<f64>() / 20.0;
+        eprintln!(
+            "GUARD-COST {} MB pool of {BLOCKS} unmapped 64 KiB placeholders: refresh {absent:.1} us ({})",
+            SIZE >> 20,
+            if absent_every() { "asking about every block, VICTORY_GUARD_ABSENT_EVERY=1" } else { "found absent in this frame already" }
+        );
+    }
+
+    /// An absent block of a placeholder the runtime reserved is asked about
+    /// once a frame: what fills it comes with a mapping notification, after
+    /// which the next refresh looks again. (A plain reservation stands in for
+    /// the placeholder: committing it without a word shows the skip.)
+    #[test]
+    fn absent_placeholder_blocks_are_asked_about_once_a_frame() {
+        // SAFETY: a fresh reservation of ours, nothing committed; kept (the
+        // guard state is shared).
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        title_memory_placeholder(p, 4 * BLOCK);
+        let refresh = || guard(p, p + 4 * BLOCK).expect("a range with nothing there counts as a view");
+        let _ = refresh(); // every block, the first time
+        assert!(refresh().is_empty(), "absent");
+        // SAFETY: commits block 1 of our reservation and writes into it.
+        unsafe {
+            assert_ne!(VirtualAlloc((p + BLOCK) as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            ((p + BLOCK + 8) as *mut u32).write_volatile(7);
+        }
+        if !absent_every() {
+            assert!(refresh().is_empty(), "found absent in this frame already");
+        }
+        title_memory_remapped(p + BLOCK, BLOCK);
+        let pages: Vec<usize> = ((p + BLOCK) / PAGE..(p + 2 * BLOCK) / PAGE).collect();
+        assert_eq!(refresh(), pages, "the block the runtime mapped is taken");
+        assert!(refresh().is_empty(), "and guarded from then on");
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

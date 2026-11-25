@@ -159,6 +159,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if at.is_null() && constrained && highest < FOUR_GIB {
         at = low_guards::retry(size, || allocate(&mut parameter));
     }
+    if placeholder && !at.is_null() {
+        // Only our mappings fill it: the GPU side need not ask about its
+        // unmapped blocks at every refresh.
+        victory_gpu::title_memory_placeholder(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
