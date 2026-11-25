@@ -64,6 +64,30 @@ impl SigElement {
 }
 
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
+/// Gives the elements of a row whose interpolation mode nothing decided
+/// (float elements, unless `read` and read) the mode the row's other
+/// elements agree on: DXIL wants one mode per row, and the console's
+/// signature, packed by the source's modes, had one (an int or a system
+/// value beside a float means the float was `nointerpolation`).
+pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
+    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let decided = |e: &&SigElement| e.row == Some(row) && !free(e) && e.interp != 0;
+        let mut modes = elements.iter().filter(decided).map(|e| e.interp);
+        let Some(mode) = modes.next() else { continue };
+        if modes.any(|m| m != mode) {
+            continue;
+        }
+        let undecided = |e: &&mut SigElement| e.row == Some(row) && free(e);
+        for e in elements.iter_mut().filter(undecided) {
+            e.interp = mode;
+        }
+    }
+}
+
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
@@ -89,7 +113,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -136,6 +160,8 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry: its maximum output vertices (triangles in, strips out).
+    pub gs: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -188,6 +214,15 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    }
+    if let Some(max) = p.gs {
+        // Input primitive (triangle), output topology (triangle strip),
+        // stream mask, then whether it writes a position.
+        for (k, v) in [3u32, 5, 1].into_iter().enumerate() {
+            info[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&(max as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
@@ -339,21 +374,40 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
 
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
-    let x: Vec<u32> = block
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect();
+    const K: [u32; 64] = [
+        0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
+        0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
+        0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be,
+        0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821,
+        0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa,
+        0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8,
+        0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
+        0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a,
+        0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c,
+        0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70,
+        0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05,
+        0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665,
+        0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039,
+        0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
+        0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
+        0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
+    ];
+    let x: [u32; 16] = std::array::from_fn(|i| {
+        u32::from_le_bytes([
+            block[4 * i],
+            block[4 * i + 1],
+            block[4 * i + 2],
+            block[4 * i + 3],
+        ])
+    });
     let [mut a, mut b, mut c, mut d] = *state;
-    for i in 0..64 {
+    for (i, &k) in K.iter().enumerate() {
         let (f, g) = match i / 16 {
             0 => ((b & c) | (!b & d), i),
             1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
             2 => (b ^ c ^ d, (3 * i + 5) % 16),
             _ => (c ^ (b | !d), (7 * i) % 16),
         };
-        let k = ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
         let rotated = a
             .wrapping_add(f)
             .wrapping_add(k)

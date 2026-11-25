@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -212,13 +212,19 @@ impl GraphicsState {
             .map(|e| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
+                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
+                // An appended element starts at the next multiple of
+                // min(4, its size) after the previous one, where D3D12 (and
+                // vkd3d) place it; the host pipeline gets the title's
+                // descriptions, so the offsets read here must match.
                 let offset = if e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT {
                     next[slot]
+                        .checked_next_multiple_of(bytes.clamp(1, 4))
+                        .unwrap_or(u32::MAX)
                 } else {
                     e.AlignedByteOffset
                 };
-                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
-                next[slot] = offset + bytes;
+                next[slot] = offset.saturating_add(bytes);
                 Input {
                     slot: slot as u32,
                     offset,
@@ -251,6 +257,13 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Our root parameters of the title-memory page table and of the
+    /// written-pages bitmap (`crate::memory`), if it reads or writes there.
+    pub(crate) memory: Option<u32>,
+    pub(crate) memory_dirty: Option<u32>,
+    /// Our root parameter of the heap's view addresses (`crate::memory`).
+    pub(crate) view_addresses: Option<u32>,
 }
 
 impl Stage {
@@ -270,6 +283,10 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
+    /// A graphics pipeline of the console's rectangle lists whose geometry
+    /// shader completes each rectangle (`victory_shader::emit::rectangle_gs`):
+    /// it draws them as triangles, one per rectangle.
+    pub(crate) rectangles: bool,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -327,6 +344,41 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        // `SFI0`: 64-bit atomics on typed resources and on heap resources.
+        let atomics64 = stages.iter().any(|(s, _)| {
+            let Some(t) = s.translated() else {
+                return false;
+            };
+            victory_shader::Container::parse(&t.host.dxil)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::SFI0)?
+                        .data
+                        .get(..4)?
+                        .try_into()
+                        .ok()
+                })
+                .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
+        });
+        if atomics64 && !host.heap_atomics64() {
+            return refuse(
+                "the host GPU has no 64-bit atomics on typed heap resources",
+                shaders,
+            );
+        }
+
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -339,6 +391,10 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                memory: None,
+                memory_dirty: None,
+                view_addresses: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -366,6 +422,11 @@ impl HostPipeline {
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
                 ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
+                ),
             ] {
                 for &slot in slots {
                     out.push((slot, params.len() as u32));
@@ -382,9 +443,29 @@ impl HostPipeline {
                     });
                 }
             }
+            for (used, kind, register, out) in [
+                (t.memory, D3D12_ROOT_PARAMETER_TYPE_SRV, 0, &mut stage.memory),
+                (t.memory_writes, D3D12_ROOT_PARAMETER_TYPE_UAV, 0, &mut stage.memory_dirty),
+                (t.view_addresses, D3D12_ROOT_PARAMETER_TYPE_SRV, 1, &mut stage.view_addresses),
+            ] {
+                if used {
+                    *out = Some(params.len() as u32);
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: kind,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: register,
+                                RegisterSpace: MEMORY_SPACE,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                }
+            }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter as i32),
+                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
@@ -449,6 +530,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
             });
@@ -481,16 +563,34 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
             });
         }
 
+        // Rectangle lists: a geometry shader made for the vertex shader adds
+        // each rectangle's fourth corner (else rectangles are expanded on
+        // the CPU from vertex inputs, see `draw`).
+        let gs = match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
+            (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
+                Ok(gs) => gs,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
+                    Vec::new()
+                }
+            },
+            _ => Vec::new(),
+        };
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
+            GS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+                BytecodeLength: gs.len(),
+            },
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -500,12 +600,7 @@ impl HostPipeline {
                 NumElements: g.inputs.len() as u32,
             },
             IBStripCutValue: g.strip_cut,
-            // The console's rectangle and quad types draw as triangles on
-            // the host (see `draw`).
-            PrimitiveTopologyType: match g.topology.0 {
-                RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                _ => g.topology,
-            },
+            PrimitiveTopologyType: host_topology(g),
             NumRenderTargets: g.targets.NumRenderTargets,
             RTVFormats: g.targets.RTFormats,
             DSVFormat: g.depth_format,
@@ -515,9 +610,10 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs],
             &state,
         );
+        let started = std::time::Instant::now();
         let made = super::library::pipeline(
             &name,
             // SAFETY: the description points at live data.
@@ -533,7 +629,7 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -551,14 +647,24 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
+            rectangles: !gs.is_empty(),
             slots: g.slots(),
             inputs: g.elements(),
         })
     }
 }
 
+/// The host's topology type: the console's rectangle and quad types draw
+/// as triangles on the host (see `draw`).
+fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
+    match g.topology.0 {
+        RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        _ => g.topology,
+    }
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
-/// stream form (no input layout or topology).
+/// stream form (no input layout).
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
@@ -583,6 +689,7 @@ fn mesh_pipeline(
         targets: Sub<D3D12_RT_FORMAT_ARRAY>,
         dsv: Sub<DXGI_FORMAT>,
         samples: Sub<DXGI_SAMPLE_DESC>,
+        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
     let mut stream = Stream {
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
@@ -595,6 +702,10 @@ fn mesh_pipeline(
         targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+        // The type the host derives from the mesh shader anyway, given: a
+        // pipeline library compares descriptions with it, and loads none
+        // made from a stream without it.
+        topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of::<Stream>(),
@@ -663,5 +774,69 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
+            SemanticIndex: 0,
+            Format: format,
+            InputSlot: 0,
+            AlignedByteOffset: offset,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }
+    }
+
+    fn offsets(inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> Vec<u32> {
+        let state = GraphicsState {
+            inputs: inputs.to_vec(),
+            ..GraphicsState::default()
+        };
+        state.elements().iter().map(|e| e.offset).collect()
+    }
+
+    /// An appended element after one of 1 or 2 bytes started right after
+    /// it; D3D12 aligns it to min(4, its size), so the rectangle expansion
+    /// read its vertices from the wrong bytes.
+    #[test]
+    fn appended_elements_are_aligned() {
+        const APPEND: u32 = D3D12_APPEND_ALIGNED_ELEMENT;
+        // RG8 (2 bytes) then RG32 float: 4, not 2.
+        let a = [
+            element(DXGI_FORMAT_R8G8_UNORM, 0),
+            element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+        ];
+        assert_eq!(offsets(&a), [0, 4]);
+        // R8 then R16 float: 2, not 1; then R8 packs right after it.
+        let b = [
+            element(DXGI_FORMAT_R8_UNORM, 0),
+            element(DXGI_FORMAT_R16_FLOAT, APPEND),
+            element(DXGI_FORMAT_R8_UNORM, APPEND),
+        ];
+        assert_eq!(offsets(&b), [0, 2, 4]);
+        // Already aligned layouts are unchanged.
+        let c = [
+            element(DXGI_FORMAT_R8G8B8A8_UNORM, 0),
+            element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+            element(DXGI_FORMAT_R32G32B32_FLOAT, APPEND),
+        ];
+        assert_eq!(offsets(&c), [0, 4, 12]);
+    }
+
+    /// An explicit offset near 4 GiB overflowed the next appended offset
+    /// (a panic in debug builds).
+    #[test]
+    fn a_huge_explicit_offset_does_not_overflow() {
+        let inputs = [
+            element(DXGI_FORMAT_R32G32B32A32_FLOAT, u32::MAX - 8),
+            element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
+        ];
+        let _ = offsets(&inputs);
     }
 }

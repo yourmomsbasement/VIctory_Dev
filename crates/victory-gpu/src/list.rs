@@ -114,7 +114,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -126,7 +126,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
@@ -162,11 +162,11 @@ pub(crate) extern "system" fn create_list(
     _nodes: u32,
     kind: u32,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    new_list(kind, allocator, iid, out)
+    new_list(kind, allocator, pipeline, iid, out)
 }
 
 /// The console's list creation: type, flags, node mask and barrier batch
@@ -184,7 +184,7 @@ pub(crate) extern "system" fn create_list_x(
     _: This,
     desc: *const ListDesc,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -193,10 +193,16 @@ pub(crate) extern "system" fn create_list_x(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "console command list");
-    new_list(desc.kind, allocator, iid, out)
+    new_list(desc.kind, allocator, pipeline, iid, out)
 }
 
-fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRESULT {
+fn new_list(
+    kind: u32,
+    allocator: This,
+    pipeline: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -224,9 +230,17 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
             }
         }),
         #[cfg(windows)]
-        state: Default::default(),
+        state: {
+            let mut state = crate::draw::State::default();
+            state.set_pipeline(pipeline);
+            std::sync::Mutex::new(state)
+        },
     });
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    if hr == S_OK {
+        crate::pipeline::bound(pipeline);
+    }
+    hr
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -271,8 +285,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = this;
     S_OK
 }
 
@@ -835,7 +850,10 @@ extern "system" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    let Some(end) = offset.checked_add(u64::from(count) * bytes) else {
+        return;
+    };
+    if end > size {
         return;
     }
     for i in 0..u64::from(count) {
@@ -893,16 +911,99 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
-    let start = block.as_mut_ptr();
+    let Some(block) = Upload::new(len) else {
+        return std::ptr::null_mut();
+    };
+    let start = block.start();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    // Moving the vector keeps its heap block where it is.
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
     at
 }
+
+/// Memory [`allocate_upload`] hands out, zeroed, freed when the list is
+/// reset. On Windows it lies in [4 GiB, 2^40), where translated shaders
+/// find title memory by address (`crate::memory`; the console's GPU
+/// addresses have 40 bits), and is a buffer of its own to the host copies
+/// (`crate::shadow`), so its copy is exactly it.
+struct Upload {
+    #[cfg(windows)]
+    at: usize,
+    #[cfg(windows)]
+    len: usize,
+    #[cfg(not(windows))]
+    block: Vec<u8>,
+}
+
+impl Upload {
+    #[cfg(windows)]
+    fn new(len: usize) -> Option<Upload> {
+        use windows_sys::Win32::System::Memory::{
+            MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE,
+            MemExtendedParameterAddressRequirements, PAGE_READWRITE, VirtualAlloc2,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (1usize << 32) as *mut _,
+            HighestEndingAddress: ((1usize << 40) - 1) as *mut _,
+            Alignment: 0,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // Watched like the title's pools: copies take only written pages.
+        // SAFETY: a fresh allocation; the parameter points at `requirements`,
+        // which outlives the call.
+        let at = unsafe {
+            VirtualAlloc2(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+                &mut parameter,
+                1,
+            )
+        } as usize;
+        if at == 0 {
+            return None;
+        }
+        crate::shadow::register(at, at as u64, len as u64);
+        Some(Upload { at, len })
+    }
+
+    #[cfg(not(windows))]
+    fn new(len: usize) -> Option<Upload> {
+        Some(Upload {
+            block: vec![0; len],
+        })
+    }
+
+    fn start(&self) -> *mut u8 {
+        #[cfg(windows)]
+        return self.at as *mut u8;
+        #[cfg(not(windows))]
+        return self.block.as_ptr().cast_mut();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Upload {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        crate::shadow::unregister(self.at, self.at as u64);
+        // Not guarded any more: memory allocated here next is new.
+        crate::watch::title_memory_remapped(self.at, self.len);
+        // SAFETY: our allocation; lists that still use its copy hold that.
+        unsafe { VirtualFree(self.at as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+// SAFETY: plain memory, handed out once.
+#[cfg(windows)]
+unsafe impl Send for Upload {}
 
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
@@ -957,6 +1058,40 @@ mod state {
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
+    }
+    /// `ClearUnorderedAccessViewUint(GPU handle, CPU handle, resource,
+    /// values, rectangle count, rectangles)`.
+    pub(super) extern "system" fn clear_unordered_uint(
+        this: This,
+        _gpu: u64,
+        cpu: u64,
+        _resource: This,
+        values: *const [u32; 4],
+        count: u32,
+        rects: *const RECT,
+    ) {
+        clear_unordered(this, cpu, values, false, items(rects, count));
+    }
+    /// `ClearUnorderedAccessViewFloat`, the same with four floats.
+    pub(super) extern "system" fn clear_unordered_float(
+        this: This,
+        _gpu: u64,
+        cpu: u64,
+        _resource: This,
+        values: *const [u32; 4],
+        count: u32,
+        rects: *const RECT,
+    ) {
+        clear_unordered(this, cpu, values, true, items(rects, count));
+    }
+    fn clear_unordered(this: This, cpu: u64, values: *const [u32; 4], float: bool, rects: &[RECT]) {
+        // SAFETY: the title passes four values (null is tolerated).
+        let Some(&values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        with_state(this, |list, s| {
+            s.clear_unordered(list, cpu, values, float, rects);
+        });
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(true, slot, handle));
@@ -1110,6 +1245,8 @@ mod state {
     pub(super) use super::draw as dispatch_mesh;
     pub(super) use super::draw as dispatch_mesh_x;
     pub(super) use super::ignored_state as blend_factor;
+    pub(super) use super::ignored_state as clear_unordered_float;
+    pub(super) use super::ignored_state as clear_unordered_uint;
     pub(super) use super::ignored_state as compute_constant;
     pub(super) use super::ignored_state as compute_constants;
     pub(super) use super::ignored_state as compute_table;
@@ -1339,13 +1476,16 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
-    (30, resolve_queries as *const ()),        // 0xf0
-    (78, dispatch_x as *const ()),             // 0x270
-    (98, state::dispatch_mesh_x as *const ()), // 0x310
-    (99, driver_hint as *const ()),            // 0x318
+const MORE_METHODS: [(usize, *const ()); 12] = [
+    (53, state::clear_unordered_uint as *const ()), // 0x1a8
+    (54, state::clear_unordered_float as *const ()), // 0x1b0
+    (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
+    (28, query_mark as *const ()),                  // 0xe0 BeginQuery
+    (29, query_mark as *const ()),                  // 0xe8 EndQuery
+    (30, resolve_queries as *const ()),             // 0xf0
+    (78, dispatch_x as *const ()),                  // 0x270
+    (98, state::dispatch_mesh_x as *const ()),      // 0x310
+    (99, driver_hint as *const ()),                 // 0x318
     // Pipeline syncs at the top and bottom of the pipe, 0x408 and 0x410.
     (129, sync as *const ()),
     (130, sync as *const ()),
@@ -1404,6 +1544,116 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tracing::{Event, Metadata, Subscriber, span};
+
+    struct PipelineBinds(Arc<AtomicUsize>);
+
+    impl Subscriber for PipelineBinds {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.is_event()
+                && metadata.target() == "victory_gpu::pipeline"
+                && metadata.fields().field("pipeline").is_some()
+                && metadata.fields().field("frame").is_some()
+        }
+
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            unreachable!()
+        }
+
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if self.enabled(event.metadata()) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn lists_bind_the_initial_pipeline_on_creation() {
+        use crate::pipeline::{ComputeHead, create_compute};
+
+        // A synthetic compute description matching the public ABI.
+        #[repr(C)]
+        struct ComputeDesc {
+            root: This,
+            code: *const u8,
+            size: usize,
+        }
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let desc = ListDesc {
+            kind: 0,
+            flags: 0,
+            nodes: 0,
+            barrier_batch: 0,
+        };
+        let bytes = [0xa5, 0xb6, 0xc7];
+        let compute = ComputeDesc {
+            root: null,
+            code: bytes.as_ptr(),
+            size: bytes.len(),
+        };
+        let compute = std::ptr::from_ref(&compute).cast::<ComputeHead>();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let binds = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing::Dispatch::new(PipelineBinds(binds.clone()));
+
+        tracing::dispatcher::with_default(&subscriber, || {
+            for console in [false, true] {
+                let create = |pipeline, out| {
+                    if console {
+                        create_list_x(null, &desc, allocator, pipeline, &LIST_IIDS[1], out)
+                    } else {
+                        create_list(null, 0, 0, allocator, pipeline, &LIST_IIDS[1], out)
+                    }
+                };
+                let mut pipeline = null;
+                let mut list = null;
+                assert_eq!(
+                    create_compute(null, compute, &PAGEABLE_IIDS[0], &mut pipeline),
+                    S_OK
+                );
+                let before = binds.load(Ordering::Relaxed);
+
+                assert_eq!(create(null, &mut list), S_OK);
+                assert_eq!(binds.load(Ordering::Relaxed), before);
+                assert_eq!(release(list), 0);
+
+                assert_eq!(create(pipeline, &mut list), S_OK);
+                assert_eq!(binds.load(Ordering::Relaxed), before + 1);
+                assert_eq!(release(list), 0);
+                assert_eq!(release(pipeline), 0);
+            }
+        });
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// ClearUnorderedAccessViewUint/Float and DiscardResource come before
+    /// the methods newer lists insert: the AMD upscaler calls them there.
+    #[test]
+    fn unordered_access_clears_have_the_same_slots_in_both_layouts() {
+        for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
+            assert_eq!(table.0[0x1a8 / 8], state::clear_unordered_uint as *const ());
+            assert_eq!(
+                table.0[0x1b0 / 8],
+                state::clear_unordered_float as *const ()
+            );
+            assert_eq!(table.0[0x1b8 / 8], ignored_state as *const ());
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
@@ -1433,9 +1683,12 @@ mod tests {
             slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
             S_OK
         );
-        // List-owned upload memory: aligned, writable, gone at reset.
+        // List-owned upload memory: aligned, writable, below 2^40 (where
+        // shaders find title memory), gone at reset.
         let p = allocate_upload(list, 40, 0x100);
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
+        #[cfg(windows)]
+        assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
@@ -1445,5 +1698,29 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// An offset near `u64::MAX` must not overflow and write outside the
+    /// query destination buffer.
+    #[test]
+    fn resolve_queries_rejects_overflowing_offset() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let buffer = crate::resource::test_buffer(64);
+        // Used to overflow `offset + count * 8` (panic in debug, wrap in release).
+        resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
     }
 }

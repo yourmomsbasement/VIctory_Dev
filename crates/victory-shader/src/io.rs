@@ -26,10 +26,10 @@
 //! index from the wave index (s3 bits 24-27) and the lane (`v_mbcnt`), and
 //! its group id from v5 of the first lane (`v_readfirstlane`: the group
 //! times the group size). Lane n exports vertex n (`exp pos`, `exp param`)
-//! and primitive n (`exp prim`: 10-bit vertex indices at bits 0, 10, 20,
-//! bit 31 culls); `param` entries with bit 7 are per-primitive outputs. One
-//! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
-//! primitives << 12).
+//! and primitive n (`exp prim`: 9-bit vertex indices at bits 0, 10, 20,
+//! each with an edge flag above it, bit 31 culls); `param` entries with
+//! bit 7 are per-primitive outputs. One lane sends the output counts
+//! (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices | primitives << 12).
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
@@ -130,14 +130,30 @@ pub enum Interp {
     /// This site's result (`v_interp_p2*`) is the attribute interpolated
     /// with `barycentric`; `first` are the `v_interp_p1*` halves it
     /// completes (one per path where the compiler shares a first half).
+    /// Where the compiler reused the i or j register on another path,
+    /// `unless` says where it holds something else, which no interpolating
+    /// lane may have been (emission proves it with structurisation's lane
+    /// conditions).
     Interpolated {
         attribute: Attribute,
         barycentric: Barycentric,
         first: Vec<Site>,
+        unless: Vec<Elsewhere>,
     },
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
+}
+
+/// Where an interpolation's i or j register holds another value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elsewhere {
+    /// The edge (predecessor, block) into a join that brings another value.
+    Edge(usize, usize),
+    /// A vector instruction writing the register, in the lanes that run it.
+    Write(Site),
+    /// A copy into the register, in the lanes that skip it (old value).
+    Skip(Site),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,8 +198,11 @@ pub struct Io {
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
-    /// Compute: how many SGPRs the hardware initializes
-    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
+    /// Compute and pixel: how many SGPRs the hardware initializes
+    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs);
+    /// pixel: the user SGPRs, at least the 8 ABI slots and up to the last
+    /// root parameter's, then the primitive mask and the ordered-section
+    /// (POPS) collision id, as every pixel program of the title reads them).
     pub initialized_sgprs: Option<u8>,
 }
 
@@ -292,6 +311,14 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            StageIo::Ps { .. } => {
+                let user = native
+                    .layout
+                    .iter()
+                    .map(|r| u32::from(r.user_data) + r.sgprs)
+                    .max();
+                Some(user.unwrap_or(0).clamp(8, 104) as u8 + 2)
+            }
             _ => None,
         },
         ..Io::default()
@@ -443,6 +470,7 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
 struct Pair {
     barycentric: Barycentric,
     first: Vec<Site>,
+    unless: Vec<Elsewhere>,
 }
 
 impl Pair {
@@ -451,6 +479,7 @@ impl Pair {
             attribute,
             barycentric: self.barycentric,
             first: self.first,
+            unless: self.unless,
         }
     }
 }
@@ -479,7 +508,8 @@ impl Halves<'_> {
             &mut Vec::new(),
             &mut first,
         )?;
-        let Some((kind, 1)) = barycentric(j) else {
+        let mut unless = Vec::new();
+        let Some((kind, 1)) = self.joined(j, barycentric, &mut unless) else {
             return Err("an interpolation with computed barycentrics");
         };
         for &(b, i) in &first {
@@ -499,14 +529,79 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if barycentric(i) != Some((kind, 0)) {
+            if self.joined(i, barycentric, &mut unless) != Some((kind, 0)) {
                 return Err("an interpolation with computed barycentrics");
             }
         }
         Ok(Pair {
             barycentric: kind,
             first,
+            unless,
         })
+    }
+
+    /// The barycentric `v` holds as loaded, also through joins and the
+    /// writes of lanes that skip them: every barycentric found must be the
+    /// same one, and where the register holds something else is added to
+    /// `other`.
+    fn joined(
+        &self,
+        v: Option<Value>,
+        barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
+        other: &mut Vec<Elsewhere>,
+    ) -> Option<(Barycentric, u8)> {
+        let (mut found, mut stack, mut seen) = (None, vec![v?], Vec::new());
+        while let Some(v) = stack.pop() {
+            if seen.contains(&v) {
+                continue;
+            }
+            seen.push(v);
+            if let Some(k) = barycentric(Some(v)) {
+                if found.is_some_and(|f| f != k) {
+                    return None;
+                }
+                found = Some(k);
+            } else if let Some(&(b, i)) = self.phis.get(&v) {
+                let block = &self.p.blocks[b];
+                for (n, &a) in block.phis[i].args.iter().enumerate() {
+                    if barycentric(Some(a)).is_some() || self.phis.contains_key(&a) {
+                        stack.push(a);
+                    } else {
+                        other.push(Elsewhere::Edge(block.preds[n], b));
+                    }
+                }
+            } else {
+                // A vector write keeps the old value in the lanes it skips
+                // (`v_writelane` ignores EXEC).
+                let &(b, i) = self.defs.get(&v)?;
+                let inst = &self.p.blocks[b].insts[i];
+                let &(reg, _) = inst.writes.iter().find(|w| w.1 == v)?;
+                if !matches!(reg, Reg::V(_)) || inst.name() == "v_writelane_b32" {
+                    return None;
+                }
+                // A plain copy of a barycentric: that one where it runs.
+                let copied = match (&inst.fields, inst.name()) {
+                    (Fields::Valu(c), "v_mov_b32") if c.dpp.is_none() && c.sdwa.is_none() => {
+                        match c.src.first() {
+                            Some(&Operand::Vector { reg: from, .. }) => inst.read(Reg::V(from)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match copied.filter(|&c| barycentric(Some(c)).is_some()) {
+                    Some(c) => {
+                        other.push(Elsewhere::Skip((b, i)));
+                        stack.push(c);
+                    }
+                    None => {
+                        other.push(Elsewhere::Write((b, i)));
+                        stack.push(inst.read(reg)?);
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// The instructions `v` comes from, through phis (`seen`: phis on the
@@ -611,6 +706,7 @@ mod tests {
                     },
                     barycentric: Barycentric::PerspectiveCenter,
                     first: vec![(0, 0)],
+                    unless: vec![],
                 }
             )]
         );

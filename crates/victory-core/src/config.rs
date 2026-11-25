@@ -22,6 +22,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// The user's copy of AMD FidelityFX for PC (the folder with its
+    /// upscaler DLL), which replaces a title's console build.
+    pub fidelityfx_dir: Option<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -41,12 +44,13 @@ struct FilePaths {
     data_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
+    fidelityfx_dir: Option<PathBuf>,
 }
 
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = std::env::var_os("VICTORY_CONFIG").map(PathBuf::from);
+        let explicit = explicit_config_path(|k| std::env::var_os(k));
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
@@ -96,6 +100,7 @@ impl Config {
             cache_dir,
             data_dir,
             test_titles,
+            fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
             source,
         })
     }
@@ -117,6 +122,14 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+/// The config file explicitly named by the environment, if any. An empty
+/// `VICTORY_CONFIG` means unset, like the other path variables.
+fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("VICTORY_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -185,6 +198,17 @@ mod tests {
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
+    }
+
+    #[test]
+    fn empty_config_env_is_ignored() {
+        let empty = |k: &str| (k == "VICTORY_CONFIG").then(OsString::new);
+        assert_eq!(explicit_config_path(empty), None);
+        let set = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("custom.toml"));
+        assert_eq!(
+            explicit_config_path(set),
+            Some(PathBuf::from("custom.toml"))
         );
     }
 

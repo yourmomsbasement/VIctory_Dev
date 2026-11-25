@@ -11,6 +11,14 @@
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
 //!
+//! A pixel's discard (`s_andn2 live, live, exec`, then "no lane is left":
+//! the exit) is the exception: on the console a discarded lane whose quad
+//! has a live lane stays in EXEC (`s_wqm` of the live mask), a helper of
+//! the quad's derivatives, and no lane takes the exit while its wave has a
+//! live lane. Here it runs on as a live lane and is discarded at that point
+//! ([`Structured::discards`]): the host's `discard` keeps it as a helper
+//! (derivatives read it) and drops its outputs and stores.
+//!
 //! The control-flow graph keeps its shape and must be reducible (DXIL's
 //! only requirement). Helper lanes of a pixel shader count as live: on PC
 //! their side effects are dropped too, and what they compute is only read
@@ -22,6 +30,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
+use crate::resource::lane_of;
 
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,6 +77,42 @@ pub struct Bools {
 
 /// The tables below have small integer keys; SipHash dominated run time.
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
+
+/// A set of what a walk has met: a list scan while it is small (most lane
+/// masks are a handful of nodes), a hash set once it grows.
+struct Seen<T> {
+    list: Vec<T>,
+    set: Set<T>,
+}
+
+impl<T> Default for Seen<T> {
+    fn default() -> Self {
+        Seen {
+            list: Vec::new(),
+            set: Set::default(),
+        }
+    }
+}
+
+impl<T: Copy + Eq + std::hash::Hash> Seen<T> {
+    const SCAN: usize = 32;
+
+    /// Adds `x`; false if it was already in.
+    fn insert(&mut self, x: T) -> bool {
+        if self.set.is_empty() {
+            if self.list.contains(&x) {
+                return false;
+            }
+            if self.list.len() < Self::SCAN {
+                self.list.push(x);
+                return true;
+            }
+            self.set.extend(self.list.drain(..));
+        }
+        self.set.insert(x)
+    }
+}
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
@@ -101,6 +146,9 @@ const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
+/// Cap the `ite` memo table so complex shaders cannot trigger multi-tens-of-MB
+/// HashMap resizes (e.g. 35 MB at 2^21 buckets) under concurrent compilation.
+const MAX_MEMO: usize = 1 << 18;
 
 impl Bools {
     fn new() -> Self {
@@ -132,15 +180,18 @@ impl Bools {
         vars.into_iter().map(|v| self.atoms[v as usize]).collect()
     }
 
+    /// The variables `b` tests, in the order a depth-first walk meets them.
+    /// Each node is visited once: scanning lists of every node and variable
+    /// seen made this quadratic in the size of `b`.
     fn vars(&self, b: Bool) -> Vec<u32> {
-        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
+        let (mut seen, mut found) = (Seen::default(), Seen::default());
+        let (mut vars, mut stack) = (Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
             let (v, lo, hi) = self.nodes[b.0 as usize];
-            if v == TERMINAL || seen.contains(&b) {
+            if v == TERMINAL || !seen.insert(b) {
                 continue;
             }
-            seen.push(b);
-            if !vars.contains(&v) {
+            if found.insert(v) {
                 vars.push(v);
             }
             stack.extend([lo, hi]);
@@ -184,6 +235,9 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -202,7 +256,12 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
-        self.memo.insert((f, g, h), r);
+        if !self.overflow {
+            if self.memo.len() >= MAX_MEMO {
+                self.memo.clear();
+            }
+            self.memo.insert((f, g, h), r);
+        }
         r
     }
 
@@ -228,22 +287,34 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::new())
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    /// `refuted`: conditions no lane meets, so a split reaching them again
+    /// stops at once (diagrams sharing most atoms reach the same ones often).
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        refuted: &mut HashSet<Vec<(Bool, bool)>>,
+    ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
         }
         all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        all.sort_unstable();
+        all.dedup();
+        if refuted.contains(&all) {
+            return false;
+        }
         if all.is_empty() || *budget == 0 {
             return true;
         }
         *budget -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let met = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -251,8 +322,26 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, refuted)
+        });
+        if !met {
+            refuted.insert(all);
+        }
+        met
+    }
+
+    /// The value `atom` has in every lane meeting `facts` (as [`Bools::meet`]
+    /// takes them), if they decide it.
+    pub fn decides(&self, facts: &[(Bool, bool)], atom: Atom) -> Option<bool> {
+        let x = *self
+            .unique
+            .get(&(*self.ids.get(&atom)?, Bool::FALSE, Bool::TRUE))?;
+        let can = |value| self.meet(&[facts, &[(x, value)]].concat());
+        match (can(false), can(true)) {
+            (false, true) => Some(true),
+            (true, false) => Some(false),
+            _ => None,
+        }
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -263,6 +352,9 @@ impl Bools {
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL {
             return b;
@@ -281,36 +373,54 @@ impl Bools {
         r
     }
 
-    fn restrict(&mut self, b: Bool, v: u32, value: bool, memo: &mut Map<Bool, Bool>) -> Bool {
-        let (bv, lo, hi) = self.nodes[b.0 as usize];
-        if bv == TERMINAL || bv > v {
+    /// `b` with every variable in `values` (sorted by variable) replaced by
+    /// its value. Nothing below a node testing a later variable than the
+    /// last of them changes.
+    fn restrict(&mut self, b: Bool, values: &[(u32, bool)], memo: &mut Map<Bool, Bool>) -> Bool {
+        let (v, lo, hi) = self.nodes[b.0 as usize];
+        if v == TERMINAL || values.last().is_none_or(|&(last, _)| v > last) {
             return b;
-        }
-        if bv == v {
-            return if value { hi } else { lo };
         }
         if let Some(&r) = memo.get(&b) {
             return r;
         }
-        let l = self.restrict(lo, v, value, memo);
-        let h = self.restrict(hi, v, value, memo);
-        let r = self.mk(bv, l, h);
-        memo.insert(b, r);
+        let decided = values.binary_search_by_key(&v, |&(v, _)| v).ok();
+        let r = match decided {
+            Some(i) => self.restrict(if values[i].1 { hi } else { lo }, values, memo),
+            None => {
+                let l = self.restrict(lo, values, memo);
+                let h = self.restrict(hi, values, memo);
+                self.mk(v, l, h)
+            }
+        };
+        // While only decided nodes were walked the walk is one path, which
+        // meets no node twice: the table (and its allocation) can wait.
+        if decided.is_none() || !memo.is_empty() {
+            memo.insert(b, r);
+        }
         r
     }
 
-    /// `b` with each atom that `known` decides replaced by its value.
-    fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
+    /// `b` with each atom that `known` decides replaced by its value. The
+    /// atoms are replaced together, in one walk of `b`: cofactors for
+    /// different variables commute, and a walk per atom made this cost the
+    /// size of `b` times the number of atoms.
+    fn given(&mut self, b: Bool, known: Bool) -> Bool {
+        let mut values = Vec::new();
         for v in self.vars(b) {
             let x = self.mk(v, Bool::FALSE, Bool::TRUE);
             let nx = self.not(x);
             if self.implies(known, x) {
-                b = self.restrict(b, v, true, &mut Map::default());
+                values.push((v, true));
             } else if self.implies(known, nx) {
-                b = self.restrict(b, v, false, &mut Map::default());
+                values.push((v, false));
             }
         }
-        b
+        if values.is_empty() {
+            return b;
+        }
+        values.sort_unstable();
+        self.restrict(b, &values, &mut Map::default())
     }
 }
 
@@ -345,6 +455,9 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Lane masks not derived from EXEC or VALU results (constants, opaque
+    /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
+    pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -353,6 +466,12 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// `v_readlane_b32` results of a constant lane: the SGPR value that
+    /// `v_writelane_b32` spilled to that lane, the same along every path.
+    pub restored: HashMap<Value, Value>,
+    /// A pixel's discards, by block and instruction: the lanes (EXEC there)
+    /// the instruction takes out of the live mask, which here stay in it.
+    pub discards: HashMap<(usize, usize), Bool>,
 }
 
 impl Structured {
@@ -367,7 +486,22 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, true)
+}
+
+/// The per-lane form with a pixel's discarded lanes taken out of the live
+/// mask, as the console does: wrong for derivatives after a discard, but
+/// what a program needs whose discarded lanes would read values no
+/// surviving lane does (see [`Structured::discards`]).
+pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, false)
+}
+
+fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    if !helpers {
+        l.kills.clear();
+    }
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -413,6 +547,11 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::restored`].
+    restored: Map<Value, Value>,
+    /// A pixel's discards (see [`Structured::discards`]) by block and
+    /// instruction.
+    kills: HashSet<(usize, usize)>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -460,7 +599,7 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
-        Ok(Lanes {
+        let mut l = Lanes {
             p,
             order,
             index,
@@ -476,7 +615,73 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
-        })
+            restored: Map::default(),
+            kills: HashSet::new(),
+        };
+        for block in blocks {
+            if let Exit::Branch { taken, not_taken } = block.exit
+                && let Some(last) = block.insts.last()
+                && l.discards(last)
+                && (l.kill_exit(taken) || l.kill_exit(not_taken))
+                && let Some(def) = last.read(Reg::Scc).and_then(|v| l.defs.get(&v))
+            {
+                l.kills.insert(*def);
+            }
+        }
+        for inst in blocks.iter().flat_map(|b| &b.insts) {
+            if let Fields::Valu(v) = &inst.fields
+                && inst.name() == "v_readlane_b32"
+                && let [Operand::Vector { reg, .. }, lane] = v.src[..]
+                && let Some(lane) = lane_of(lane)
+                && let Some(spill) = inst.read(Reg::V(reg))
+                && let Ok(Some(s)) = l.spilled(spill, lane, &mut Vec::new())
+                && let Some(&(_, r)) = inst.writes.first()
+            {
+                l.restored.insert(r, s);
+            }
+        }
+        Ok(l)
+    }
+
+    /// What lane `lane` of VGPR value `v` holds when `v_writelane_b32` put
+    /// an SGPR there: `Ok(None)` for a phi in `seen` (being resolved).
+    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(s) = self.spilled(a, lane, seen)? {
+                    if found.is_some_and(|f| f != s) {
+                        return Err(());
+                    }
+                    found = Some(s);
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = self.defs.get(&v).ok_or(())?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" {
+            return Err(());
+        }
+        if lane_of(*at).ok_or(())? != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != NULL => {
+                inst.read(Reg::S(code)).map(Some).ok_or(())
+            }
+            _ => Err(()),
+        }
     }
 
     fn reset(&mut self) {
@@ -532,14 +737,44 @@ impl<'a> Lanes<'a> {
                     now = Some(e);
                 }
                 self.step(inst, now);
+                if self.kills.contains(&(b, i))
+                    && let Fields::Sop {
+                        dst: Some(Operand::Scalar { code, .. }),
+                        ..
+                    } = inst.fields
+                    && let (Some(old), Some(new)) = (
+                        self.key(|r| inst.read(r), code),
+                        self.key(|r| inst.write(r), code),
+                    )
+                {
+                    let m = self.mask(old).0;
+                    self.masks.insert(new, m);
+                    if let Some(scc) = inst.write(Reg::Scc) {
+                        self.scc_lane.insert(scc, m);
+                    }
+                }
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
-            if let Exit::Branch { .. } = p.blocks[b].exit
+            if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                self.when[b] = Some(self.branch(last));
+                let mut w = self.branch(last);
+                // A discard's "no lane is left" exit: no lane takes it (the
+                // live mask keeps every lane, see `kills`).
+                if last
+                    .read(Reg::Scc)
+                    .and_then(|v| self.defs.get(&v))
+                    .is_some_and(|d| self.kills.contains(d))
+                {
+                    if self.kill_exit(taken) {
+                        w = Bool::FALSE;
+                    } else if self.kill_exit(not_taken) {
+                        w = Bool::TRUE;
+                    }
+                }
+                self.when[b] = Some(w);
             }
         }
         execs
@@ -592,6 +827,9 @@ impl<'a> Lanes<'a> {
             .iter()
             .enumerate()
             .map(|(n, block)| {
+                // Reachability is fixed within the block. Vector instructions
+                // with the same EXEC therefore need the same guard.
+                let mut last_guard = None;
                 block
                     .insts
                     .iter()
@@ -601,8 +839,16 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
-                        (&Some(e), _) if b.implies(cond[n], e) => None,
-                        (&Some(e), _) => Some(b.given(e, cond[n])),
+                        (&Some(e), _) => {
+                            if let Some((prev, guard)) = last_guard
+                                && prev == e
+                            {
+                                return guard;
+                            }
+                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
+                            last_guard = Some((e, guard));
+                            guard
+                        }
                     })
                     .collect()
             })
@@ -626,6 +872,7 @@ impl<'a> Lanes<'a> {
         }
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
                 .keys()
@@ -634,6 +881,12 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            restored: self.restored.into_iter().collect(),
+            discards: self
+                .kills
+                .iter()
+                .filter_map(|&(b, i)| execs[b][i].map(|e| ((b, i), e)))
+                .collect(),
             bools: self.b,
             exits,
             guards,
@@ -675,9 +928,15 @@ impl<'a> Lanes<'a> {
             return (m, false);
         }
         let p = self.p;
-        let (m, derived) = match self.join(k) {
-            Some(join) => join,
-            None => {
+        let restored = (
+            self.restored.get(&k.0).copied(),
+            self.restored.get(&k.1).copied(),
+        );
+        let (m, derived) = match (self.join(k), restored) {
+            (Some(join), _) => join,
+            // A mask spilled to VGPR lanes and read back: the same mask.
+            (None, (Some(lo), Some(hi))) => self.mask((lo, hi)),
+            (None, _) => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
                 let m = match (lo, hi) {
@@ -922,7 +1181,8 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        takes_mask |= self.masks.contains_key(&k)
+                            || phi && !self.joins_loaded(k) && self.mask(k).1;
                     }
                 }
                 let touches_exec =
@@ -999,6 +1259,68 @@ impl<'a> Lanes<'a> {
             }
             _ => {}
         }
+    }
+
+    /// Whether a join takes a value loaded from memory on some edge: data
+    /// that the other paths leave a stale lane mask in place of (a register
+    /// reused after a branch), so operations on it are no mask operations.
+    fn joins_loaded(&self, k: Key) -> bool {
+        [k.0, k.1].iter().any(|v| {
+            self.phis.get(v).is_some_and(|&(b, i)| {
+                self.p.blocks[b].phis[i].args.iter().any(|a| {
+                    self.defs.get(a).is_some_and(|&(db, di)| {
+                        matches!(self.p.blocks[db].insts[di].fields, Fields::Smem { .. })
+                    })
+                })
+            })
+        })
+    }
+
+    /// Whether `inst` branches on the SCC of `s_andn2 X, X, exec`: whether
+    /// any lane is left in a pixel's live mask after a discard.
+    fn discards(&self, inst: &Inst) -> bool {
+        if !inst.name().starts_with("s_cbranch_scc") {
+            return false;
+        }
+        let Some(&(db, di)) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v)) else {
+            return false;
+        };
+        let def = &self.p.blocks[db].insts[di];
+        let Fields::Sop {
+            dst: Some(d), src, ..
+        } = &def.fields
+        else {
+            return false;
+        };
+        matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
+            && src.first() == Some(d)
+            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
+    }
+
+    /// Whether a lane entering block `b` leaves the program doing nothing but
+    /// scalar work and a `done` export to `null` (a discard's exit).
+    fn kill_exit(&self, mut b: usize) -> bool {
+        for _ in 0..8 {
+            let block = &self.p.blocks[b];
+            let mut null_done = false;
+            for inst in &block.insts {
+                match inst.fields {
+                    Fields::Exp {
+                        target: 9,
+                        done: true,
+                        ..
+                    } => null_done = true,
+                    Fields::Sop { .. } | Fields::Sopp { .. } => {}
+                    _ => return false,
+                }
+            }
+            match block.exit {
+                Exit::End => return null_done,
+                Exit::Jump(next) if !null_done => b = next,
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// The per-lane condition under which a block's closing branch is taken.
@@ -1145,6 +1467,74 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_spilled_to_a_vgpr_lane_comes_back_as_itself() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_036A, // s_mov_b32 s0, vcc_lo
+                0xD761_0001,
+                0x0001_0600, // v_writelane_b32 v1, s0, 3
+                0xD760_0005,
+                0x0001_0701, // v_readlane_b32 s5, v1, 3
+                0xBE86_3C05, // s_and_saveexec_b32 s6, s5
+                0xBF88_0001, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        let saved = insts[1].write(Reg::S(0)).unwrap();
+        let restored = insts[3].write(Reg::S(5)).unwrap();
+        assert_eq!(s.restored.get(&restored), Some(&saved));
+        // Skipped exactly where the compare fails, as without the spill.
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits)
+        };
+        let cmp = insts[0].write(Reg::S(VCC)).unwrap();
+        assert_eq!(
+            s.bools.node(when),
+            Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
+        );
+    }
+
+    #[test]
+    fn data_loaded_where_a_mask_was_is_no_mask() {
+        // s1 holds a mask on one path and a loaded value on the other; the
+        // bit test after the join is data (wave32: `_b32` operations would
+        // otherwise read as mask operations).
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE81_036A, // s_mov_b32 s1, vcc_lo
+                0xBF06_8004, // s_cmp_eq_u32 s4, 0
+                0xBF85_0002, // s_cbranch_scc1 -> join
+                0xF400_0041,
+                0xFA00_0000, // s_load_dword s1, s[2:3], 0
+                0x8702_FF01,
+                0x0010_0000, // join: s_and_b32 s2, s1, 0x100000
+                0xBF06_8002, // s_cmp_eq_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let join = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "s_and_b32"))
+            .unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[join] else {
+            panic!("{:?}", s.exits)
+        };
+        let scc = p.blocks[join].insts[1].write(Reg::Scc).unwrap();
+        assert_eq!(s.bools.support(when), vec![Atom::Uniform(scc)]);
+    }
+
+    #[test]
     fn exec_narrowed_without_a_branch_leaves_a_guard() {
         let p = build(
             &[
@@ -1158,6 +1548,37 @@ mod tests {
         assert_eq!(s.guards[0][0], None, "the compare runs in every lane");
         let g = s.guards[0][1].expect("guard");
         assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
+    }
+
+    #[test]
+    fn guards_follow_exec_and_block_reachability() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBF88_0005, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7DA4_0880, // v_cmpx_eq_u32 exec, 0, v4
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let lane = |block: usize, i: usize| {
+            Atom::Lane(p.blocks[block].insts[i].write(Reg::S(EXEC)).unwrap())
+        };
+        let a = s.guards[0][1].unwrap();
+        let b = s.guards[1][2].unwrap();
+        assert_eq!(s.bools.node(a), Some((lane(0, 0), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[0], [None, Some(a), Some(a), None]);
+        // The fallthrough already implies the first compare. Only the second
+        // compare needs testing, and the scalar move never needs a guard.
+        assert_eq!(s.bools.node(b), Some((lane(1, 1), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[1], [None, None, Some(b), None, Some(b)]);
     }
 
     #[test]
@@ -1230,5 +1651,212 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    /// [`Bools::vars`] as it was: lists of the nodes and variables seen.
+    fn vars_by_scan(b: &Bools, root: Bool) -> Vec<u32> {
+        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![root]);
+        while let Some(n) = stack.pop() {
+            let (v, lo, hi) = b.nodes[n.0 as usize];
+            if v == TERMINAL || seen.contains(&n) {
+                continue;
+            }
+            seen.push(n);
+            if !vars.contains(&v) {
+                vars.push(v);
+            }
+            stack.extend([lo, hi]);
+        }
+        vars
+    }
+
+    /// One variable's cofactor, as `restrict` did before it took several.
+    fn restrict_one(
+        b: &mut Bools,
+        f: Bool,
+        v: u32,
+        value: bool,
+        memo: &mut Map<Bool, Bool>,
+    ) -> Bool {
+        let (bv, lo, hi) = b.nodes[f.0 as usize];
+        if bv == TERMINAL || bv > v {
+            return f;
+        }
+        if bv == v {
+            return if value { hi } else { lo };
+        }
+        if let Some(&r) = memo.get(&f) {
+            return r;
+        }
+        let l = restrict_one(b, lo, v, value, memo);
+        let h = restrict_one(b, hi, v, value, memo);
+        let r = b.mk(bv, l, h);
+        memo.insert(f, r);
+        r
+    }
+
+    /// [`Bools::given`] as it was: a walk of `f` per decided variable.
+    fn given_by_walks(b: &mut Bools, mut f: Bool, known: Bool) -> Bool {
+        for v in vars_by_scan(b, f) {
+            let x = b.mk(v, Bool::FALSE, Bool::TRUE);
+            let nx = b.not(x);
+            if b.implies(known, x) {
+                f = restrict_one(b, f, v, true, &mut Map::default());
+            } else if b.implies(known, nx) {
+                f = restrict_one(b, f, v, false, &mut Map::default());
+            }
+        }
+        f
+    }
+
+    /// Atoms `0..n` of a fresh [`Bools`], in variable order.
+    fn atoms(n: u64) -> (Bools, Vec<Bool>) {
+        let mut b = Bools::new();
+        let xs = (0..n).map(|i| b.atom(Atom::Constant(i), 0)).collect();
+        (b, xs)
+    }
+
+    /// `x[i] == y[i]` for every `i`, with every `x` ordered before every
+    /// `y`: the classic order that makes the diagram exponential in `n`.
+    fn pairs_equal(b: &mut Bools, xs: &[Bool], n: usize) -> Bool {
+        let mut f = Bool::TRUE;
+        for i in 0..n {
+            let ne = b.xor(xs[i], xs[n + i]);
+            let eq = b.not(ne);
+            f = b.and(f, eq);
+        }
+        f
+    }
+
+    /// A deterministic mix of ands, ors and xors over `xs`.
+    fn mixed(b: &mut Bools, xs: &[Bool], seed: u64, steps: usize) -> Bool {
+        let mut s = seed;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (s >> 33) as usize
+        };
+        let mut f = xs[next() % xs.len()];
+        for _ in 0..steps {
+            let x = xs[next() % xs.len()];
+            let x = if next() % 2 == 0 { b.not(x) } else { x };
+            f = match next() % 3 {
+                0 => b.and(f, x),
+                1 => b.or(f, x),
+                _ => b.xor(f, x),
+            };
+        }
+        f
+    }
+
+    /// The function of `f` on the assignment `bits` (bit `v`: variable `v`).
+    fn value_at(b: &Bools, mut f: Bool, bits: u64) -> bool {
+        loop {
+            match f {
+                Bool::FALSE => return false,
+                Bool::TRUE => return true,
+                _ => {
+                    let (v, lo, hi) = b.nodes[f.0 as usize];
+                    f = if bits >> v & 1 == 1 { hi } else { lo };
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vars_match_the_scan() {
+        let (mut b, xs) = atoms(16);
+        let mut fs = vec![Bool::FALSE, Bool::TRUE, xs[3], pairs_equal(&mut b, &xs, 8)];
+        for seed in 0..40 {
+            fs.push(mixed(&mut b, &xs, seed, 30));
+        }
+        for f in fs {
+            assert_eq!(b.vars(f), vars_by_scan(&b, f));
+        }
+    }
+
+    #[test]
+    fn given_matches_a_walk_per_variable() {
+        let (mut b, xs) = atoms(12);
+        for seed in 0..60 {
+            let f = mixed(&mut b, &xs, seed, 24);
+            let known = mixed(&mut b, &xs, seed ^ 0x9e37, 3);
+            let fast = b.given(f, known);
+            // Equal functions are equal nodes, so the ids match too.
+            assert_eq!(fast, given_by_walks(&mut b, f, known), "seed {seed}");
+            // Where `known` holds, the result agrees with `f`.
+            for bits in 0..1u64 << 12 {
+                if value_at(&b, known, bits) {
+                    assert_eq!(value_at(&b, fast, bits), value_at(&b, f, bits));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn given_replaces_every_decided_atom() {
+        let (mut b, xs) = atoms(12);
+        let f = pairs_equal(&mut b, &xs, 6);
+        // x0..x5 all true: f becomes y0 && .. && y5.
+        let mut known = Bool::TRUE;
+        let mut ys = Bool::TRUE;
+        for i in 0..6 {
+            known = b.and(known, xs[i]);
+            ys = b.and(ys, xs[6 + i]);
+        }
+        assert_eq!(b.given(f, known), ys);
+        // Nothing decided: unchanged; a contradiction decides nothing useful
+        // but must not panic.
+        assert_eq!(b.given(f, Bool::TRUE), f);
+        let _ = b.given(f, Bool::FALSE);
+        assert_eq!(b.given(Bool::TRUE, known), Bool::TRUE);
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p victory-shader bench_bools -- --ignored --nocapture"]
+    fn bench_bools() {
+        // Microseconds per call, over at least 3 calls and 50 ms.
+        let time = |f: &mut dyn FnMut()| {
+            let (t, mut calls) = (std::time::Instant::now(), 0);
+            while calls < 3 || t.elapsed().as_millis() < 50 {
+                f();
+                calls += 1;
+            }
+            t.elapsed().as_secs_f64() * 1e6 / f64::from(calls)
+        };
+        for n in [2, 4, 8, 10, 12, 13] {
+            let (mut b, xs) = atoms(2 * n as u64);
+            let f = pairs_equal(&mut b, &xs, n);
+            let count = vars_by_scan(&b, f).len();
+            let size = {
+                let (mut seen, mut stack) = (Set::default(), vec![f]);
+                while let Some(g) = stack.pop() {
+                    let (v, lo, hi) = b.nodes[g.0 as usize];
+                    if v != TERMINAL && seen.insert(g) {
+                        stack.extend([lo, hi]);
+                    }
+                }
+                seen.len()
+            };
+            // Half the x's known true.
+            let mut known = Bool::TRUE;
+            for x in &xs[..n / 2] {
+                known = b.and(known, *x);
+            }
+            let (expect, mut got) = (given_by_walks(&mut b, f, known), Bool::FALSE);
+            let vars_old = time(&mut || assert_eq!(vars_by_scan(&b, f).len(), count));
+            let vars_new = time(&mut || assert_eq!(b.vars(f).len(), count));
+            let given_old = time(&mut || got = given_by_walks(&mut b, f, known));
+            assert_eq!(got, expect);
+            let given_new = time(&mut || got = b.given(f, known));
+            assert_eq!(got, expect);
+            println!(
+                "n={n} nodes={size}: vars {vars_old:.2} -> {vars_new:.2} us ({:.1}x), \
+                 given {given_old:.2} -> {given_new:.2} us ({:.1}x)",
+                vars_old / vars_new,
+                given_old / given_new
+            );
+        }
     }
 }
