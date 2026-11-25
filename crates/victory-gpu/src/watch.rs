@@ -14,11 +14,9 @@
 //! wholly uncommitted are skipped while they remain so; one query can
 //! confirm a whole region, including ordinary reservations between views.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! A guarded page can have several title addresses. Its contents are clean
+//! only while all of those views are protected. DirectStorage also fills
+//! physical pages through temporary views and reports those writes on completion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -379,16 +377,105 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Registered 64 KiB title blocks and the section page each one maps.
+    physical: BTreeMap<usize, (usize, u64)>,
+    aliases: BTreeMap<(usize, u64), Aliases>,
+    /// Virtual block ranges the kernel may currently be filling.
+    kernel_writes: Vec<std::ops::Range<usize>>,
+    /// Registered physical-page destinations of outstanding overlapped I/O.
+    /// Its completion belongs to the title, so keep these writable until remap.
+    overlapped: BTreeSet<usize>,
+}
+
+#[derive(Default)]
+struct Aliases {
+    blocks: BTreeSet<usize>,
+    all_protected: bool,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    physical: BTreeMap::new(),
+    aliases: BTreeMap::new(),
+    kernel_writes: Vec::new(),
+    overlapped: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn view_mapped(at: usize, len: usize, section: usize, offset: u64) {
+    let mut g = guards();
+    let g = &mut *g;
+    for i in 0..len / BLOCK {
+        let block = at / BLOCK + i;
+        let key = (section, offset / BLOCK as u64 + i as u64);
+        g.physical.insert(block, key);
+        let aliases = g.aliases.entry(key).or_default();
+        if aliases.all_protected {
+            for peer in &aliases.blocks {
+                g.clean.remove(peer);
+            }
+            aliases.all_protected = false;
+        }
+        aliases.blocks.insert(block);
+    }
+}
+
+pub(crate) fn view_gone(at: usize, len: usize) {
+    let mut g = guards();
+    for block in at / BLOCK..(at + len) / BLOCK {
+        g.overlapped.remove(&block);
+        if let Some(key) = g.physical.remove(&block)
+            && let Some(aliases) = g.aliases.get_mut(&key)
+        {
+            aliases.blocks.remove(&block);
+            if aliases.blocks.is_empty() {
+                g.aliases.remove(&key);
+            }
+        }
+    }
+}
+
+/// The runtime filled section bytes through a temporary DirectStorage view.
+/// Its private mapping bypasses every guard on the title's virtual views.
+pub fn physical_written(section: usize, offset: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let first = offset / BLOCK as u64;
+    let last = offset.saturating_add(len as u64 - 1) / BLOCK as u64;
+    let mut g = guards();
+    let g = &mut *g;
+    for (_, aliases) in g.aliases.range((section, first)..=(section, last)) {
+        for &peer in &aliases.blocks {
+            g.clean.remove(&peer);
+        }
+    }
+}
+
+fn mark_clean(g: &mut Guards, block: usize) {
+    if let Some(key) = g.physical.get(&block)
+        && let Some(aliases) = g.aliases.get_mut(key)
+        && !aliases.all_protected
+    {
+        for &peer in &aliases.blocks {
+            if !g.protected.contains(&peer) {
+                if !read_only(&g.kernel_writes, &g.overlapped, peer, peer + 1) {
+                    // A partially committed or unmapped peer can still change.
+                    return;
+                }
+                g.protected.insert(peer);
+            }
+        }
+        aliases.all_protected = true;
+    }
+    // Each reader reports its dirty block once, even when a peer was the
+    // first to re-arm the group's guards.
+    g.clean.insert(block);
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -449,7 +536,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
-                g.clean.insert(block);
+                mark_clean(&mut g, block);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -506,33 +593,40 @@ fn is_view(start: usize, end: usize) -> bool {
     }
 }
 
-/// Makes blocks `[from, to)` read-only and notes them guarded and clean;
-/// block by block if they span views, leaving out any that fail, and
-/// noting those not committed (unmapped) absent.
-fn protect(g: &mut Guards, from: usize, to: usize) {
+fn read_only(
+    writers: &[std::ops::Range<usize>],
+    overlapped: &BTreeSet<usize>,
+    from: usize,
+    to: usize,
+) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    let set = |from: usize, to: usize| {
-        let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        }
-    };
+    if writers.iter().any(|r| r.start < to && from < r.end)
+        || overlapped.range(from..to).next().is_some()
+    {
+        return false;
+    }
+    let mut old = 0;
+    // SAFETY: title view memory; only its protection changes.
+    unsafe {
+        VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) != 0
+    }
+}
+
+/// Arms a run at once when possible. Failed runs are attempted by block,
+/// so holes and views in different reservations do not hide resident pages.
+fn protect(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        for block in from..to {
+            mark_clean(g, block);
+        }
     };
-    if set(from, to) {
+    if read_only(&g.kernel_writes, &g.overlapped, from, to) {
         note(g, from, to);
         return;
     }
     for block in from..to {
-        if set(block, block + 1) {
+        if read_only(&g.kernel_writes, &g.overlapped, block, block + 1) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
@@ -568,6 +662,15 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        if let Some(key) = g.physical.get(&block)
+            && let Some(aliases) = g.aliases.get_mut(key)
+            && aliases.all_protected
+        {
+            for peer in &aliases.blocks {
+                g.clean.remove(peer);
+            }
+            aliases.all_protected = false;
+        }
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -575,15 +678,49 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
-/// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
+/// Opens the guarded blocks before the GPU layer writes title memory through
+/// the kernel. File reads that can overlap refreshes use [`kernel_write`].
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+/// Keeps a kernel-write destination writable until the operation returns.
+pub struct KernelWrite(std::ops::Range<usize>);
+
+pub fn kernel_write(at: usize, len: usize) -> KernelWrite {
+    let end = at.saturating_add(len);
+    let first = at / BLOCK;
+    let range = first..if len == 0 { first } else { end.div_ceil(BLOCK) };
+    let mut g = guards();
+    if len > 0 {
+        open(&mut g, at, end);
+    }
+    g.kernel_writes.push(range.clone());
+    drop(g);
+    crate::descriptor::host::remapped(at, len);
+    KernelWrite(range)
+}
+
+impl KernelWrite {
+    /// An overlapped read returned pending. This shim does not receive its
+    /// completion, so aliases of registered page destinations stay uncached.
+    pub fn pending(&self) {
+        let mut g = guards();
+        let g = &mut *g;
+        g.overlapped.extend(g.physical.range(self.0.clone()).map(|(&block, _)| block));
+    }
+}
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        let mut g = guards();
+        if let Some(i) = g.kernel_writes.iter().position(|r| *r == self.0) {
+            g.kernel_writes.swap_remove(i);
+        }
+    }
 }
 
 /// Held shared by a read of title memory in place, and alone by the runtime
@@ -721,6 +858,78 @@ mod tests {
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     #[test]
+    fn writes_through_another_view_refresh_the_readers_page() {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            SEC_COMMIT, UnmapViewOfFile,
+        };
+        struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+        impl Drop for View {
+            fn drop(&mut self) {
+                title_memory_remapped(self.0.Value as usize, BLOCK);
+                // SAFETY: this view owns its mapping.
+                unsafe { UnmapViewOfFile(self.0) };
+            }
+        }
+        // SAFETY: fresh committed section and two writable, independent views.
+        let section = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(),
+            PAGE_READWRITE | SEC_COMMIT, 0, BLOCK as u32, std::ptr::null()) };
+        assert!(!section.is_null());
+        // SAFETY: the section handle was just created and has one owner.
+        let section_handle = unsafe { OwnedHandle::from_raw_handle(section) };
+        let section = section_handle.as_raw_handle();
+        let map = || {
+            let view = View(unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK) });
+            assert!(!view.0.Value.is_null());
+            let at = view.0.Value as usize;
+            title_memory_remapped(at, BLOCK);
+            crate::title_memory_view(at, BLOCK, section as usize, 0);
+            view
+        };
+        let reader = map();
+        let at = reader.0.Value as usize;
+        let refresh = || guard(at, at + BLOCK).unwrap();
+        assert_eq!(refresh(), [at / PAGE]);
+        assert!(refresh().is_empty());
+        let writer = map();
+        let peer = writer.0.Value as usize;
+        // SAFETY: the mapping holds a full writable block.
+        unsafe { writer.0.Value.cast::<u32>().write_volatile(0x80000007) };
+        assert_eq!(refresh(), [at / PAGE], "write through a newly mapped alias");
+        assert!(refresh().is_empty());
+        assert_eq!(guard(peer, peer + BLOCK).unwrap(), [peer / PAGE]);
+        unsafe { writer.0.Value.cast::<u32>().write_volatile(0x80000009) };
+        assert_eq!(refresh(), [at / PAGE], "later write through the same alias");
+        assert_eq!(guard(peer, peer + BLOCK).unwrap(), [peer / PAGE]);
+        assert!(refresh().is_empty());
+        // DirectStorage fills this section through its own writable view.
+        // Only notification of the affected physical bytes can reveal it.
+        let temp = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK) };
+        assert!(!temp.Value.is_null());
+        unsafe { temp.Value.cast::<u32>().write_volatile(0x80000003) };
+        physical_written(section as usize, BLOCK as u64, 4);
+        assert!(refresh().is_empty(), "write to a different physical page");
+        physical_written(section as usize, 0, 4);
+        assert_eq!(refresh(), [at / PAGE]);
+        assert_eq!(guard(peer, peer + BLOCK).unwrap(), [peer / PAGE]);
+        assert!(refresh().is_empty());
+        unsafe { UnmapViewOfFile(temp) };
+        let file_read = kernel_write(peer, 4);
+        assert_eq!(refresh(), [at / PAGE]);
+        assert!(writable(peer), "refresh through an alias during a kernel write");
+        file_read.pending();
+        drop(file_read);
+        assert_eq!(refresh(), [at / PAGE]);
+        assert!(writable(peer), "the title owns completion of its overlapped read");
+        drop(writer);
+        assert_eq!(refresh(), [at / PAGE]);
+        assert!(refresh().is_empty(), "last writable alias unmapped");
+        drop(reader);
+    }
+
+    #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -792,8 +1001,12 @@ mod tests {
             !read(&mut file),
             "the kernel does not fault into our handler"
         );
-        writing(view + 100, 13);
-        assert!(read(&mut file));
+        {
+            let _destination = kernel_write(view + 100, 13);
+            // A simultaneous GPU refresh cannot re-arm the file destination.
+            assert_eq!(guard(view, view + BLOCK).unwrap(), [view / PAGE]);
+            assert!(read(&mut file));
+        }
         // SAFETY: the bytes just read.
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
