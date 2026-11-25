@@ -37,6 +37,7 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
+    pub(crate) view_heap: victory_shader::emit::ViewHeapSize,
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
@@ -237,7 +238,15 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        // OPTIONS19 is absent on older Windows runtimes. The portable
+        // layout remains valid there and is also the offline default.
+        use victory_shader::emit::ViewHeapSize;
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        let extended = device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19,
+            (&raw mut caps).cast(), size_of_val(&caps) as u32).is_ok()
+            && caps.MaxViewDescriptorHeapSize >= ViewHeapSize::Extended.slots();
         Ok(Host {
+            view_heap: if extended { ViewHeapSize::Extended } else { ViewHeapSize::Portable },
             device,
             queue,
             fence,

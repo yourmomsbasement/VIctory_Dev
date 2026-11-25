@@ -238,12 +238,15 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
     assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
     // 32 elements of 12 bytes: (100 + e, 200 + e, 300 + e).
     let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    // Byte-address view aligned down one dword from the structured data.
+    let raw: Vec<u32> = std::iter::once(0xdead_beef).chain(data.iter().copied()).collect();
     let views = [
         View::RawUav(32),
         View::Buffer {
             data: &data,
             stride: Stride::Structured(12),
         },
+        View::Buffer { data: &raw, stride: Stride::Raw },
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -279,7 +282,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
                             1,
                             Root::View {
                                 srv: true,
-                                data: vec![4, 12],
+                                data: vec![4, 0, 12, (2 << 4) | 4],
                             },
                         ),
                     ],
@@ -333,7 +336,7 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         }
         let dispatch = Dispatch {
             // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
+            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0, 0, 0] })],
             views: &views,
             samplers: &[],
             groups: [1, 1, 1],
@@ -399,7 +402,7 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
                 &Dispatch {
                     // User data, then the stride table: heap index 1 holds a
                     // buffer view.
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0, 4, 0] })],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],

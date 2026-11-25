@@ -14,6 +14,10 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
+    slots: u32,
+    /// Stable raw view pairs for structured title slots read by a
+    /// shader whose element stride is known only at dispatch time.
+    raw_aliases: Mutex<std::collections::HashMap<u32, u32>>,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -40,9 +44,9 @@ pub(crate) struct HostHeap {
     pairs: Mutex<(u32, Vec<u32>)>,
     pairs_end: u32,
     /// View heaps: the view-stride table translated shaders read
-    /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
-    /// byte stride of the buffer view there, 0 for none. Mapped at the
-    /// address kept beside it.
+    /// (`victory_shader::emit::VIEW_STRIDES`). Each physical slot has two
+    /// dwords: the byte stride (zero for no buffer) and the encoded raw
+    /// alias. Mapped at the address kept beside it.
     strides: Option<(ID3D12Resource, usize)>,
     /// Per title slot, the title address of the buffer view it holds, as a
     /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
@@ -75,10 +79,6 @@ pub(crate) fn near_heaps(va: u64) -> String {
     }
     text
 }
-
-/// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -113,16 +113,16 @@ impl HostHeap {
         };
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
-        // which has no bounds, at indices clamped below `HEAP_VIEWS`.
+        // which has no bounds, at indices clamped to the physical heap.
+        let views = host.view_heap.slots();
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| host.upload_buffer(u64::from(views) * 8))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
-        // `HEAP_SAMPLERS`: slots up to there exist and stay null.
-        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
+        // View-heap bounds in the translated shader match this allocation.
+        let samplers = victory_shader::emit::HEAP_SAMPLERS;
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -131,24 +131,17 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
-            (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
+            // Final three slots are the null raw UAV, null raw SRV and
+            // the fallback for an index past the heap. Never allocate
+            // title slots, dynamic slots or persistent view pairs there.
+            let available = views - 3;
+            let extra = if count <= available - DYNAMIC { DYNAMIC } else { MIN_DYNAMIC };
+            let mirrored = count.min(available - extra);
+            if mirrored < count {
+                tracing::warn!(count, mirrored, views, "title view heap exceeds the host layout");
             }
+            (make(views).map_err(|e| tracing::warn!(error = %e, views, "no host view heap")).ok()?, mirrored, extra)
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -169,6 +162,8 @@ impl HostHeap {
             sampler,
         ));
         let h = HostHeap {
+            slots: total,
+            raw_aliases: Default::default(),
             heap,
             cpu,
             step,
@@ -179,10 +174,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
-                null if !sampler && null > count + extra && null < total => null - 1,
-                _ => total,
-            },
+            pairs_end: if sampler { total } else { views - 3 },
             strides,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
@@ -202,12 +194,10 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !sampler && null > count + extra && null < total {
+        let null = host.view_heap.null_buffer();
+        if !sampler {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
-        } else if !sampler {
-            tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
         }
         Some(h)
     }
@@ -437,6 +427,7 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
+            self.clear_alias(index);
             null_view(self.cpu(index));
         }
         self.keep(index, None);
@@ -453,13 +444,67 @@ impl HostHeap {
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
+        self.write_buffer_info(index, stride, 0);
+    }
+
+    fn write_buffer_info(&self, index: u32, stride: u32, raw: u32) {
         let Some((_, data)) = &self.strides else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= self.slots {
             return;
         }
-        // SAFETY: a dword of the mapped table, which has one per slot below
-        // the larger of the title's count and `HEAP_VIEWS`.
-        unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
+        // SAFETY: two dwords for every physical view-heap slot.
+        unsafe { (*data as *mut [u32; 2]).add(index as usize).write_volatile([stride, raw]) };
+    }
+
+    fn clear_alias(&self, index: u32) {
+        let mut aliases = self.raw_aliases.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pair) = aliases.remove(&index) {
+            self.raw_view_at(pair, None, 0, 0, true);
+            self.raw_view_at(pair + 1, None, 0, 0, false);
+            self.free_pair(pair);
+        }
+    }
+
+    /// Keep the original structured descriptor for statically typed reads.
+    /// A byte-address operation needs a raw descriptor over those same
+    /// bytes. Its base is aligned down to 16 bytes and the shader adds
+    /// the low four bits. Aliases stay with the slot over rewrites.
+    fn indexed_buffer_info(&self, index: u32, view: &View, kept: &Kept) {
+        let stride = view_stride(view);
+        let description = match view {
+            View::Shader(_, Some(d)) | View::Unordered(_, _, Some(d)) => Some(&d[..]),
+            View::Placed(_, resource, d) if resource[0] == 1 => Some(&d[..]),
+            _ => None,
+        };
+        let unordered = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+        let structured = description.is_some_and(|d| d[1] == 1 && d[if unordered { 5 } else { 7 }] != 0);
+        if !structured {
+            self.clear_alias(index);
+            self.write_stride(index, stride);
+            return;
+        }
+        let alias = (|| {
+            let (buffer, exact) = kept.as_ref()?;
+            let (address, len) = buffer_range(view)?;
+            let shadow = exact.clone().or_else(|| crate::shadow::find(address, len))?;
+            if shadow.buffer != *buffer { return None; }
+            let offset = shadow.offset(address);
+            let bias = offset & 15;
+            if len == 0 || len % 4 != 0 || bias % 4 != 0 { return None; }
+            let mut aliases = self.raw_aliases.lock().unwrap_or_else(|e| e.into_inner());
+            let pair = match aliases.entry(index) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => *e.insert(self.pair()?),
+            };
+            self.raw_view_at(pair, unordered.then_some(buffer), offset - bias, len + bias, true);
+            self.raw_view_at(pair + 1, Some(buffer), offset - bias, len + bias, false);
+            Some(((pair + 1) << 4) | bias as u32)
+        })();
+        // A refused alias uses the typed null pair at the end of the heap.
+        if alias.is_none() {
+            self.clear_alias(index);
+        }
+        self.write_buffer_info(index, stride, alias.unwrap_or((self.slots - 2) << 4));
     }
 
     /// The view-stride table, for root SRV `VIEW_STRIDES`.
@@ -616,7 +661,6 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
-            self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
             // are made when written.
@@ -637,7 +681,9 @@ impl HostHeap {
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
-            self.keep(index, kept.flatten());
+            let kept = kept.flatten();
+            if !self.sampler { self.indexed_buffer_info(index, &view, &kept); }
+            self.keep(index, kept);
         }
         Some(view)
     }
@@ -1407,6 +1453,47 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn structured_slot_reuses_and_clears_its_raw_alias() {
+        let Some(heap) = HostHeap::new(false, 1) else { return };
+        let p = crate::watch::tests::pool(1);
+        let bytes = crate::watch::PAGE;
+        crate::shadow::register(p, p as u64, bytes as u64);
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        resource[4] = bytes as u32;
+        let mut desc = [0; 16];
+        desc[1] = 1; // buffer SRV
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[6] = 2; // two elements of 12 bytes each
+        desc[7] = 12;
+        desc[10] = p as u32;
+        desc[11] = (p as u64 >> 32) as u32;
+        let record = || {
+            let (_, data) = heap.strides.as_ref().unwrap();
+            // SAFETY: the first two mapped dwords belong to slot zero.
+            unsafe { (*data as *const [u32; 2]).read_volatile() }
+        };
+        let mut pair = None;
+        for first in [1, 2] {
+            desc[4] = first;
+            let view = View::Placed(false, resource, desc);
+            let kept = make(&view, heap.cpu(0)).unwrap();
+            heap.indexed_buffer_info(0, &view, &kept);
+            heap.keep(0, kept);
+            let [stride, alias] = record();
+            assert_eq!(stride, 12);
+            assert_eq!(alias & 15, first * 12 % 16);
+            assert!((heap.count + heap.dynamic..heap.pairs_end).contains(&(alias >> 4)));
+            assert_eq!(*pair.get_or_insert(alias >> 4), alias >> 4);
+        }
+        heap.make_null(0);
+        assert_eq!(record(), [0, 0]);
+        assert_eq!(heap.pair(), pair.map(|srv| srv - 1));
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

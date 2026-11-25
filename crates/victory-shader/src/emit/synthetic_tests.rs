@@ -89,7 +89,8 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         }],
         used: vec![
             range(ResourceType::Srv, 0, 8, 0),
-            range(ResourceType::Srv, 8, 4, 16),
+            // A 16-byte input record spans two structured elements.
+            range(ResourceType::Srv, 8, 4, 8),
             range(ResourceType::Uav, 16, 4, 0),
         ],
         io: StageIo::Cs(ComputeIo {
@@ -207,7 +208,7 @@ fn gathers_at_a_level_match_the_hardware() {
         View::Mipped(24, 16, 4, &texels),
         View::Buffer {
             data: &input,
-            stride: Stride::Structured(16),
+            stride: Stride::Structured(8),
         },
         View::RawUav(32 * 12),
     ];

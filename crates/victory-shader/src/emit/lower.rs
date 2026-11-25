@@ -81,9 +81,15 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_for_heap(parts, super::ViewHeapSize::Portable)
+}
+
+pub(super) fn lower_for_heap(parts: &Parts, heap: super::ViewHeapSize) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut lower = Lower::new(parts, &bad);
+        lower.s.view_heap = heap;
+        match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -4676,10 +4682,9 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The byte stride of the buffer view a heap-indexed descriptor names
-    /// (descriptors from the resource heap only): dword `index` of the
-    /// host's view-stride table, root SRV [`VIEW_STRIDES`].
-    fn view_stride(&mut self, src: &Source) -> Result<V, Why> {
+    /// Resolve the raw handle, element stride and alignment bias of a
+    /// resource-heap buffer from its two-dword [`VIEW_STRIDES`] record.
+    fn indexed_buffer(&mut self, src: &Source, props: (u32, u32)) -> Result<(V, V, V), Why> {
         const WHY: Why = "a structured buffer of unknown stride";
         let heap = |load: &Site| {
             self.scalar
@@ -4702,11 +4707,14 @@ impl<'a> Lower<'a> {
             _ => self.lane_heap_index(src, false)?,
         };
         let c = self.cur;
+        let last = self.s.m.i32(self.s.view_heap.slots() - 1);
+        let index = self.s.op(c, "binary.i32", Attr::ReadNone, self.s.t.i32, 40, &[index, last]);
         let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
+        let eight = self.s.m.i32(8);
+        let at = self.s.m.bin(c, Bin::Mul, index, eight);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         let iu = self.s.m.undef(self.s.t.i32);
-        let mask = self.s.m.i8(1);
+        let mask = self.s.m.i8(3);
         let r = self.s.op(
             c,
             "rawBufferLoad.f32",
@@ -4716,7 +4724,24 @@ impl<'a> Lower<'a> {
             &[table, at, iu, mask, four],
         );
         let x = self.s.m.extract(c, r, 0);
-        Ok(self.as_int(x))
+        let stride = self.as_int(x);
+        let encoded = self.s.m.extract(c, r, 1);
+        let encoded = self.as_int(encoded);
+        let zero = self.s.m.i32(0);
+        let direct = self.s.m.cmp(c, pred::EQ, encoded, zero);
+        let mut alias = self.s.m.bin(c, Bin::LShr, encoded, four);
+        let uav = u32::from(props.0 & 0x1000 != 0);
+        if uav != 0 {
+            let one = self.s.m.i32(1);
+            alias = self.s.m.bin(c, Bin::Sub, alias, one);
+        }
+        let slot = self.s.m.select(c, direct, index, alias);
+        let null = self.s.m.i32(self.s.view_heap.null_buffer() - uav);
+        let empty = self.s.m.cmp(c, pred::EQ, stride, zero);
+        let slot = self.s.m.select(c, empty, null, slot);
+        let mask = self.s.m.i32(15);
+        let bias = self.s.m.bin(c, Bin::And, encoded, mask);
+        Ok((self.s.heap_handle(c, slot, false, true, props), stride, bias))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -4953,11 +4978,12 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(self.s.view_heap.slots() - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
+        let eight = self.s.m.i32(8);
+        let at = self.s.m.bin(c, Bin::Mul, index, eight);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
         let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
@@ -4966,7 +4992,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = self.s.view_heap.null_buffer() - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
@@ -8707,17 +8733,77 @@ impl<'a> Lower<'a> {
         // A heap-indexed buffer read by element has no used-resource entry,
         // so no stride: its bytes are addressed as the hardware does, the
         // element times the view's stride (the host's table) plus the offset.
-        let index = match index {
-            Some(i) if used.is_none() && !typed => {
-                let stride = self.view_stride(src)?;
-                let rows = self.s.m.bin(c, Bin::Mul, i, stride);
-                off = self.s.m.bin(c, Bin::Add, rows, off);
-                None
-            }
-            index => index,
-        };
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
+        let table_stride = used
+            .filter(|u| u.root == RootType::Table && u.stride >= 4 && u.stride.is_multiple_of(4))
+            .filter(|_| index.is_none() && !typed && sub.is_none())
+            .map(|u| u.stride);
+        if let Some(stride) = table_stride.filter(|_| count > 1) {
+            // Byte-addressed vectors can straddle structured elements. Give
+            // each dword the element and member of its own byte address.
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a vector buffer operand");
+            };
+            let handle = self.handle(site, src, false, (12 | u, stride))?;
+            let stride = self.s.m.i32(stride);
+            let mask = self.s.m.i8(1);
+            let align = self.s.m.i32(4);
+            let undef = self.s.m.undef(self.s.t.i32);
+            let values = if store {
+                self.vgprs(inst, data.as_ref().unwrap(), count as u8)?
+            } else {
+                Vec::new()
+            };
+            let begin = store.then(|| self.begin_guarded(guard));
+            for k in 0..count {
+                let step = self.s.m.i32(4 * k);
+                let at = self.s.m.bin(self.cur, Bin::Add, off, step);
+                let row = self.s.m.bin(self.cur, Bin::UDiv, at, stride);
+                let member = self.s.m.bin(self.cur, Bin::URem, at, stride);
+                if store {
+                    let args = [handle, row, member, values[k as usize], undef, undef, undef, mask, align];
+                    self.s.op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, self.s.t.void, 140, &args);
+                } else {
+                    let args = [handle, row, member, mask, align];
+                    let r = self.s.op(self.cur, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &args);
+                    let value = self.s.m.extract(self.cur, r, 0);
+                    let value = self.as_int(value);
+                    self.write(inst, Reg::V(reg + k as u8), value, guard);
+                }
+            }
+            if let Some(begin) = begin {
+                self.end_guarded(begin, &[]);
+            }
+            return Ok(());
+        }
+        let mut indexed = None;
+        let index = match (index, table_stride) {
+            (None, Some(stride)) => {
+                let stride = self.s.m.i32(stride);
+                let element = self.s.m.bin(c, Bin::UDiv, off, stride);
+                off = self.s.m.bin(c, Bin::URem, off, stride);
+                Some(element)
+            }
+            (Some(i), _) if used.is_none() && !typed => {
+                let (handle, stride, bias) = self.indexed_buffer(src, (11 | u, 0))?;
+                let rows = self.s.m.bin(c, Bin::Mul, i, stride);
+                off = self.s.m.bin(c, Bin::Add, rows, off);
+                indexed = Some((handle, bias));
+                None
+            }
+            (index, _) => index,
+        };
+        let raw = |l: &mut Self, at: V, bytes: u32, write: bool| {
+            if let Some((handle, bias)) = indexed {
+                // Raw views cover at most 512 MiB. A huge unsigned offset
+                // must stay outside the view when its alignment bias is added.
+                let limit = l.s.m.i32(0x7fff_ffff);
+                let at = l.s.op(l.cur, "binary.i32", Attr::ReadNone, l.s.t.i32, 40, &[at, limit]);
+                return Ok((handle, l.s.m.bin(l.cur, Bin::Add, at, bias)));
+            }
+            l.raw_view(site, src, at, bytes, (11 | u, 0), write, guard)
+        };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -8732,7 +8818,7 @@ impl<'a> Lower<'a> {
                     (h, [index, off, iu])
                 }
                 None => {
-                    let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
+                    let (h, off) = raw(self, off, 4, true)?;
                     (h, [off, iu, iu])
                 }
             };
@@ -8791,7 +8877,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
+            let (h, at) = raw(self, at, 4, true)?;
             let begin = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
@@ -8850,7 +8936,7 @@ impl<'a> Lower<'a> {
                     None => {
                         let bytes = 4 * count;
                         let (h, off) =
-                            self.raw_view(site, src, off, bytes, (11 | u, 0), true, guard)?;
+                            raw(self, off, bytes, true)?;
                         args.extend([h, off, iu]);
                     }
                 }
@@ -8872,7 +8958,7 @@ impl<'a> Lower<'a> {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
-            let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
+            let (h, off) = raw(self, off, 4 * count, false)?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
@@ -8893,7 +8979,7 @@ impl<'a> Lower<'a> {
             }
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
+            let (h, at) = raw(self, at, 4, false)?;
             let c = self.cur;
             let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
             let r = self.s.op(
@@ -8960,7 +9046,7 @@ impl<'a> Lower<'a> {
                 None => {
                     let bytes = 4 * count;
                     let (h, off) =
-                        self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
+                        raw(self, off, bytes, false)?;
                     self.s.op(
                         self.cur,
                         "rawBufferLoad.f32",

@@ -13,22 +13,39 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
-/// parameter) of the view-stride table: dword `i` is the byte stride of
-/// the buffer view at view-heap index `i`.
+/// parameter) of the view-stride table. Each view-heap slot has two
+/// dwords: its buffer stride and the encoded raw alias.
 pub const VIEW_STRIDES: u8 = 255;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+/// Portable view-heap size for standalone translation.
+pub const HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
+/// The descriptor layout shared by shader compilation and the host heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewHeapSize {
+    Portable,
+    Extended,
+}
+
+impl ViewHeapSize {
+    pub const fn slots(self) -> u32 {
+        match self {
+            Self::Portable => HEAP_VIEWS,
+            Self::Extended => 1 << 21,
+        }
+    }
+
+    pub const fn null_buffer(self) -> u32 {
+        self.slots() - 2
+    }
+}
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+pub const NULL_BUFFER_VIEW: u32 = ViewHeapSize::Portable.null_buffer();
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -66,6 +83,7 @@ pub(crate) struct Mesh {
 }
 
 pub(crate) struct Shader {
+    pub view_heap: ViewHeapSize,
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
@@ -133,6 +151,7 @@ impl Shader {
         let main = m.function("main", main_ty, None, true);
         let entry = m.new_block();
         Shader {
+            view_heap: ViewHeapSize::Portable,
             m,
             t: Types {
                 void,
@@ -456,7 +475,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { self.view_heap.slots() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));

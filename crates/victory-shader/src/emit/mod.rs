@@ -68,9 +68,9 @@
 //!   the resource heap (no used-resource entry, so no stride) are raw too,
 //!   addressed at element × the view's stride + offset, the stride from
 //!   the view-stride table: root SRV `t`[`VIEW_STRIDES`] in
-//!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`], whose dword
-//!   `i` the host keeps at the byte stride of the buffer view at heap
-//!   index `i`.
+//!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`]. Each slot has
+//!   two dwords: the byte stride and a raw alias. An alias packs the SRV
+//!   index above a four-bit byte bias. Zero selects the original view.
 //! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
 //!   loads through a descriptor taken from the resource heap itself (root
 //!   type 5, so no used-resource entry) read a raw buffer view, not a
@@ -82,17 +82,17 @@
 //! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner `v0 + v2 - v1`, as the console's hardware does.
-//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
-//!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
+//! * **Heap indices** (added 2026-11-24) are clamped to the selected
+//!   [`ViewHeapSize`] minus one (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
 //!   still wrong; the console would read whatever memory follows its heap)
 //!   reads nothing instead of faulting the device.
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV
-//!   `t`[`VIEW_STRIDES`], which then covers every index below
-//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
+//!   `t`[`VIEW_STRIDES`], which covers the entire physical heap, dynamic
+//!   slots too); where the stride is 0 (no buffer view there) the shader
+//!   reads [`ViewHeapSize::null_buffer`] in that heap instead (for
 //!   unordered access the index below), which the host keeps a null raw
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
@@ -204,7 +204,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_STRIDES,
+    USER_DATA_SPACE, VIEW_STRIDES, ViewHeapSize,
 };
 
 /// The loop limit without an override: 2^20.
@@ -332,6 +332,11 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_for_heap(container, ViewHeapSize::Portable)
+}
+
+/// Translate for the descriptor layout used by the executing device.
+pub fn translate_for_heap(container: &[u8], heap: ViewHeapSize) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -355,7 +360,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_for_heap(&c, &native, &p, &st, &io, &res, heap)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -366,6 +371,13 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_for_heap(c, native, p, st, io, res, ViewHeapSize::Portable)
+}
+
+fn emit_for_heap(
+    c: &Container, native: &NativeProgram, p: &ir::Program, st: &structure::Structured,
+    io: &io::Io, res: &resource::Resources, heap: ViewHeapSize,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -433,14 +445,14 @@ pub fn emit(
         prims: prims.clone(),
         mesh_stride,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_for_heap(&parts(st, res), heap) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_for_heap(&parts(&st, &res), heap)?
         }
         l => l?,
     };
