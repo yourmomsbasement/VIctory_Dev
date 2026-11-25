@@ -2698,6 +2698,22 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
+        // Why the flights were settled anyway: the settle "title memory changed under shader
+        // writes" (47.8 ms a frame in a world scene, one settle a frame) is one of these.
+        let (refused, last) = crate::shadow::merge_refused_stats();
+        let [unwatched, unknown, no_snapshot, runs_out] = refused.map(|n| n as f64 / frames);
+        tracing::info!(
+            "merges under flights refused per frame (the flights settled instead): {unwatched:.1} copies not watched, \
+             {unknown:.1} ranges whose writes neither the journal nor the guards could say, {no_snapshot:.1} without a \
+             snapshot, {runs_out:.1} past the changed runs for copies in the card's memory; the last: {}",
+            match last {
+                Some((start, len, card, why, a, e)) => format!(
+                    "copy {start:#x}+{len:#x} ({}), reason {why}, range {a:#x}..{e:#x}",
+                    if card { "in the card's memory" } else { "in PC memory" }
+                ),
+                None => "none".into(),
+            }
+        );
     }
 }
 

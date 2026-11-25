@@ -1324,6 +1324,24 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Why [`Shadow::merge_under_writes`] left a settle to the caller, by
+/// reason: the copy is not watched, the journal and the guards could not
+/// say what the title wrote, the snapshot is missing, the changed runs for
+/// copies in the card's memory ran out.
+static MERGE_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The last copy a merge was refused for: start, length, whether it is in
+/// the card's memory, the reason ([`MERGE_REFUSED`]'s index), the range.
+static MERGE_REFUSED_LAST: Mutex<Option<(u64, u64, bool, usize, usize, usize)>> = Mutex::new(None);
+
+/// [`MERGE_REFUSED`], taken, and the last copy refused.
+pub(crate) fn merge_refused_stats() -> ([u64; 4], Option<(u64, u64, bool, usize, usize, usize)>) {
+    (
+        [0, 1, 2, 3].map(|i| MERGE_REFUSED[i].swap(0, Ordering::Relaxed)),
+        MERGE_REFUSED_LAST.lock().unwrap_or_else(|e| e.into_inner()).take(),
+    )
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2235,6 +2253,12 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        let refused = |why: usize, a: usize, e: usize| {
+            MERGE_REFUSED[why].fetch_add(1, Ordering::Relaxed);
+            *MERGE_REFUSED_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((self.start, self.len, self.card.is_some(), why, a, e));
+            true
+        };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -2252,7 +2276,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
+            return refused(0, from, to);
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
@@ -2264,7 +2288,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                return true;
+                return refused(1, a, e);
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2303,7 +2327,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
-                        return true;
+                        return refused(3, lo, hi);
                     }
                     *runs_left -= runs.len();
                     for (r, m) in runs {
@@ -2314,7 +2338,8 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
-                        return true;
+                        drop(before);
+                        return refused(2, lo, hi);
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
                     // bytes at the copy's offsets (`writing`), and these
