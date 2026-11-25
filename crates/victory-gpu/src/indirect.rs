@@ -685,11 +685,13 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                // Not gathering: u2 is bound only for the root signature.
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode, 0];
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, differs_gpu);
                 let (x, y) = crate::host::card_compare_grid(PIECES);
                 warp.list.Dispatch(x, y, 1);
             }
@@ -719,6 +721,90 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// With 4 the compare also puts each differing piece's bytes, as it saw
+    /// them, into the next free slot of the gathered buffer (flag 2 + slot);
+    /// past the slots it flags 1, for a fetch. A skewed copy's slot starts at
+    /// the 16-byte vector holding the piece's first byte.
+    #[test]
+    fn warp_card_compare_gathers_differing_pieces() {
+        use crate::host::{GATHER_HEADER, GATHER_STRIDE, gathered_slot};
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let gathered_size = (GATHER_HEADER + 2 * GATHER_STRIDE) as u64;
+        let (_gathered, gathered_ptr, gathered_gpu) = warp.shared_buffer(gathered_size);
+        let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 509) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32, slots: u32, skew: u32, first: u32| -> [u32; 3] {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                gathered_ptr.cast::<u32>().write_volatile(0);
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [first, skew, size as u32, PIECES, 0, mode, slots];
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, gathered_gpu);
+                let (x, y) = crate::host::card_compare_grid(PIECES);
+                warp.list.Dispatch(x, y, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        // SAFETY (each): inside the mappings.
+        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        let slot_bytes = |slot: u32, len: usize| -> Vec<u8> {
+            // SAFETY: a slot of the gathered mapping.
+            unsafe { std::slice::from_raw_parts(gathered_ptr.add(GATHER_HEADER + slot as usize * GATHER_STRIDE), len).to_vec() }
+        };
+        let now_bytes = |at: usize, len: usize| -> Vec<u8> {
+            // SAFETY: inside the mapping.
+            unsafe { std::slice::from_raw_parts(now_ptr.add(at), len).to_vec() }
+        };
+        // Hashes first; then a change in pieces 1 and 2, compared with 1 + 4.
+        assert_eq!(run(&mut warp, 0, 0, 0, 0), [7, 7, 7]);
+        set(PIECE + 10, content[PIECE + 10] ^ 0x11);
+        set(2 * PIECE + 20, content[2 * PIECE + 20] ^ 0x22);
+        let flags = run(&mut warp, 1 | 4, 2, 0, 0);
+        assert_eq!(flags[0], 0);
+        let (s1, s2) = (gathered_slot(flags[1]).expect("piece 1 gathered"), gathered_slot(flags[2]).expect("piece 2 gathered"));
+        assert_ne!(s1, s2);
+        assert_eq!(slot_bytes(s1, PIECE), now_bytes(PIECE, PIECE));
+        assert_eq!(slot_bytes(s2, PIECE), now_bytes(2 * PIECE, PIECE));
+        // SAFETY: the count of slots taken.
+        assert_eq!(unsafe { gathered_ptr.cast::<u32>().read_volatile() }, 2);
+        // One slot only: one piece gathered, the other flagged for a fetch.
+        let flags = run(&mut warp, 1 | 4, 1, 0, 0);
+        let mut kinds = [flags[1], flags[2]].map(|f| gathered_slot(f).is_some());
+        kinds.sort_unstable();
+        assert_eq!(kinds, [false, true]);
+        assert!(flags[1] != 0 && flags[2] != 0);
+        // Without 4 nothing is gathered, and the flags are those of before.
+        assert_eq!(run(&mut warp, 1, 2, 0, 0), [0, 1, 1]);
+        // A skewed copy (piece 1 starts 48 bytes before 64 KiB): the slot
+        // holds the piece from its first vector on.
+        assert_eq!(run(&mut warp, 0, 0, 48, 1), [7, 7, 7]);
+        set(PIECE - 48 + 5, content[PIECE - 48 + 5] ^ 0x33);
+        let flags = run(&mut warp, 2 | 4, 2, 48, 1);
+        let s = gathered_slot(flags[0]).expect("skewed piece 1 gathered");
+        assert_eq!(slot_bytes(s, PIECE), now_bytes(PIECE - 48, PIECE));
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
