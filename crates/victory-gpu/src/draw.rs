@@ -1617,6 +1617,12 @@ impl State {
                 continue;
             }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            if view.is_none() && matches!(heap.handle(index).and_then(crate::descriptor::view),
+                Some(View::Placed(false, r, _)) if r[0] != 1)
+            {
+                host.texture_slot_later(index, write, frame, most);
+                continue;
+            }
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
