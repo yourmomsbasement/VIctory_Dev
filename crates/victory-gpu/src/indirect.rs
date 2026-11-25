@@ -667,16 +667,19 @@ void main() {
         let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
+        assert_eq!(crate::host::card_groups(32768), (32768, 1));
+        assert_eq!(crate::host::card_groups(32769), (32768, 2));
+        assert_eq!(crate::host::card_groups(65536), (32768, 2));
         let size = PIECE * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
-        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
         // One pass over the three pieces; what it left in `differs` (7s
         // where it stored nothing).
-        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+        let run_span = |warp: &mut WarpHarness, mode: u32, first: u32, skew: u32| -> [u32; 3] {
             // SAFETY: our open list, live buffers, the compare's own root
             // signature; the mappings hold what is read and written.
             unsafe {
@@ -685,17 +688,19 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
+                let constants = [first, skew, size as u32, PIECES, 0, mode];
                 warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_groups(PIECES);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
+        let run = |warp: &mut WarpHarness, mode| run_span(warp, mode, 0, 0);
         let at = PIECE + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
@@ -718,6 +723,19 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+
+        // A skewed allocation has a short final piece. Start hashing at
+        // piece 1, swap two lanes' inputs, and change the very last byte.
+        let tail = |warp: &mut WarpHarness, mode| run_span(warp, mode, 1, 48);
+        assert_eq!(tail(&mut warp, 0), [7, 7, 7]);
+        assert_eq!(tail(&mut warp, 1), [0, 0, 0]);
+        // SAFETY: two disjoint vectors in piece 1 and one byte in piece 3.
+        unsafe {
+            std::ptr::swap_nonoverlapping(now_ptr.add(PIECE), now_ptr.add(PIECE + 16), 16);
+            now_ptr.add(size - 1).write_volatile(content[size - 1] ^ 1);
+        }
+        assert_eq!(tail(&mut warp, 2), [1, 0, 1]);
+        assert_eq!(tail(&mut warp, 1), [0, 0, 0]);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
