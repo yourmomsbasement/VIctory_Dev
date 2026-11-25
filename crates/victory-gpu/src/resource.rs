@@ -1649,6 +1649,38 @@ fn host_texture(
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);
     }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    if d.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32 {
+        // Keep the packed texture readable and copyable on adapters where
+        // only the FP16 intermediate can be bound for rendering or stores.
+        static USES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let uses = USES.get_or_init(|| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+                ..Default::default()
+            };
+            // SAFETY: the query writes one format support structure.
+            let result = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            if result.is_err() {
+                return 0;
+            }
+            let mut uses = 0;
+            if support.Support1.contains(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) {
+                uses |= TARGET;
+            }
+            if support.Support1.contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) {
+                uses |= UNORDERED;
+            }
+            uses
+        });
+        d.flags &= !(TARGET | UNORDERED) | *uses;
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1662,7 +1694,7 @@ fn host_texture(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (!clear.is_null() && d.flags & (TARGET | DEPTH) != 0).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);

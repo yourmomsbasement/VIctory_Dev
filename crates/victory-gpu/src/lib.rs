@@ -25,6 +25,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
@@ -41,6 +43,8 @@ mod primitive;
 pub mod query;
 pub mod queue;
 pub mod resource;
+#[cfg(windows)]
+pub mod rgb9e5;
 pub mod root;
 #[cfg(windows)]
 mod sampler;

@@ -535,6 +535,17 @@ impl State {
                 }
                 continue;
             };
+            if crate::host::legal_state(texture, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32) == 0 {
+                // The packed upscaler output may only allow copies. Keep
+                // its MRT slot without making an RTV on that resource.
+                let null = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                };
+                rtvs.push(host.rtv(None, Some(&null)));
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
@@ -599,6 +610,13 @@ impl State {
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
         self.stencil = Some(reference);
         crate::draw::stencil_ref(list, reference);
+    }
+
+    /// A host upscaler can replace both heaps, the pipeline and its root signature.
+    pub(crate) fn host_state_lost(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [usize::MAX; 2];
     }
 
     /// `list` is a new host list that continues the title's list (it was
