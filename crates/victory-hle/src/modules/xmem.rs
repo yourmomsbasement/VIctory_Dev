@@ -670,29 +670,67 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 {
+        return true;
+    }
+    if !len.is_multiple_of(PAGE)
+        || !to.is_multiple_of(PAGE)
+        || !from.is_multiple_of(PAGE)
+        || to.checked_add(len).is_none()
+    {
+        return false;
+    }
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
+    if from == 0 {
+        unmap(&mut physical, to, len);
+        return true;
+    }
+    let Some(end) = from.checked_add(len) else {
+        return false;
+    };
+    // Save the source section and slices before replacing any views: a
+    // destination can cover part of the source, or the source can have a hole.
+    let source = |at: usize| {
+        let (&base, (size, slice)) = physical.views.range(..=at).next_back()?;
+        let within = at - base;
+        (within < *size).then(|| {
+            let first = Slice {
+                index: slice.index + within / PAGE,
+                section: slice.section.clone(),
+            };
+            (first, (size - within).min(end - at))
+        })
+    };
+    let Some(first) = source(from) else {
+        return false;
+    };
+    // No allocation for the usual single pool page, or any one source view.
+    let mut rest = Vec::new();
+    let mut at = from + first.1;
+    while at < end {
+        let Some(run) = source(at) else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
-            return false;
+        at += run.1;
+        rest.push(run);
+    }
+    if from == to {
+        return true;
+    }
+    unmap(&mut physical, to, len);
+    let mut at = to;
+    for (first, bytes) in std::iter::once(first).chain(rest) {
+        for k in 0..bytes / PAGE {
+            let slice = Slice {
+                index: first.index + k,
+                section: first.section.clone(),
+            };
+            if !map(&mut physical, at, PAGE, slice) {
+                return false;
+            }
+            at += PAGE;
         }
     }
     true
@@ -1192,6 +1230,64 @@ mod tests {
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn gpu_page_copies_keep_the_source_mappings() {
+        let pages = allocate(4);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            6 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let at = |index: usize| base.wrapping_byte_add(index * PAGE);
+        let copy = |to, from, count: usize| {
+            map_alias(at(to) as u64, at(from) as u64, (count * PAGE) as u64)
+        };
+        let values = || {
+            std::array::from_fn::<_, 5, _>(|i| {
+                assert_eq!(query(at(i)).host.State, MEM_COMMIT);
+                // SAFETY: the mapping was checked above and belongs to this test.
+                unsafe { at(i).cast::<u8>().read() }
+            })
+        };
+        assert_eq!(XMemMapPhysicalPages(base, 4, pages.as_ptr()), base);
+        assert_eq!(XMemMapPhysicalPages(at(4), 1, pages.as_ptr()), at(4));
+        for i in 0..4 {
+            // SAFETY: these four distinct pages are mapped read-write.
+            unsafe { at(i).cast::<u8>().write(i as u8 + 1) };
+        }
+        assert!(copy(1, 0, 4));
+        assert_eq!(values(), [1, 1, 2, 3, 4]);
+        assert!(copy(0, 1, 4));
+        assert_eq!(values(), [1, 2, 3, 4, 4]);
+        assert!(copy(2, 2, 3));
+        assert_eq!(values(), [1, 2, 3, 4, 4]);
+        // The last source page is a hole. Keep all destination mappings.
+        assert!(!copy(0, 3, 3));
+        assert_eq!(values(), [1, 2, 3, 4, 4]);
+        assert!(copy(1, 2, 3));
+        assert_eq!(values(), [1, 3, 4, 4, 4]);
+        // These must still alias the same physical page after the copies.
+        // SAFETY: both pages are mapped read-write.
+        unsafe {
+            at(4).cast::<u8>().write(77);
+            assert_eq!(at(2).cast::<u8>().read(), 77);
+            assert_eq!(at(3).cast::<u8>().read(), 77);
+        }
+        assert!(map_alias(base as u64, 0, (5 * PAGE) as u64));
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        // Splitting the reservation for the views left separate placeholders.
+        let mut offset = 0;
+        while offset < 6 * PAGE {
+            let address = base.wrapping_byte_add(offset);
+            offset += query(address).host.RegionSize;
+            // SAFETY: the base of a placeholder owned by this test.
+            assert_ne!(unsafe { VirtualFree(address, 0, MEM_RELEASE) }, 0);
+        }
     }
 
     #[test]
