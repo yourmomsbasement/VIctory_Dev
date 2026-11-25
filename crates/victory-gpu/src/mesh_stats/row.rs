@@ -51,6 +51,13 @@ fn selected() -> Option<&'static Row> {
     .as_ref()
 }
 
+pub(super) fn requested(resource: usize) -> bool {
+    selected().is_some_and(|row| {
+        crate::resource::texture_extent(resource as crate::object::This)
+            == Some((u64::from(row.width), row.height))
+    })
+}
+
 pub(super) fn page_bytes() -> u64 {
     selected().map_or(super::OCCLUSION_OFFSET + super::SLOTS as u64 * 8, |r| {
         START + 2 * u64::from(super::SLOTS) * r.stride

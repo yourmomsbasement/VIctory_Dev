@@ -1927,7 +1927,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     let overridden = self.override_mesh_scissor(list);
                     #[cfg(feature = "diagnostics")]
-                    let query = crate::mesh_stats::begin(list, self.pipeline, None, &self.targets, self.depth, self.heaps[0]);
+                    let query = self.draw_query(list, crate::mesh_stats::Command::Mesh(None));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     #[cfg(feature = "diagnostics")]
@@ -2415,11 +2415,17 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let query = self.draw_query(list, crate::mesh_stats::Command::Raster(None));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(query) = query {
+                query.end(list);
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2433,6 +2439,13 @@ impl State {
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
         crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn draw_query(
+        &self, list: &HostList, command: crate::mesh_stats::Command<'_>,
+    ) -> Option<crate::mesh_stats::Active> {
+        crate::mesh_stats::begin(list, self.pipeline, command, &self.targets, self.depth, self.heaps[0])
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -2516,11 +2529,17 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let query = self.draw_query(list, crate::mesh_stats::Command::Raster(None));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(query) = query {
+                query.end(list);
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2735,7 +2754,9 @@ impl State {
                 max,
                 reused,
             };
-            crate::mesh_stats::begin(list, self.pipeline, Some(inputs), &self.targets, self.depth, self.heaps[0])
+            self.draw_query(list, crate::mesh_stats::Command::Mesh(Some(inputs)))
+        } else if kind == DRAW || kind == INDEXED {
+            self.draw_query(list, crate::mesh_stats::Command::Raster(Some(arguments)))
         } else {
             None
         };

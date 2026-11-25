@@ -1,7 +1,8 @@
 //! Per-draw mesh, rasterizer and occlusion counters for selected capture frames.
 //! Enable with VICTORY_MESH_STATS=1 and select frames as for the command trace.
 //! VICTORY_MATERIAL_ROW=1280x720@160 also records which pixels each material
-//! draw changes along row 160 of its first color target.
+//! draw changes along row 160 of its first color target, including ordinary
+//! vertex and indexed draws such as the game's dynamic decals.
 
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
@@ -93,10 +94,15 @@ pub(crate) struct Active {
     row: Option<row::Probe>,
 }
 
+pub(crate) enum Command<'a> {
+    Mesh(Option<Arguments<'a>>),
+    Raster(Option<u64>),
+}
+
 pub(crate) fn begin(
     list: &HostList,
     pipeline: usize,
-    args: Option<Arguments<'_>>,
+    command: Command<'_>,
     targets: &[usize],
     depth: usize,
     heap: usize,
@@ -106,6 +112,12 @@ pub(crate) fn begin(
     }
     let frame = crate::queue::presented() + 1;
     if !crate::capture::listed(frame) {
+        return None;
+    }
+    // The same material target is bound with six attachments for opaque
+    // geometry and decals, then with three for other surface passes.
+    let row_target = targets.first().copied().filter(|&target| row::requested(target));
+    if matches!(command, Command::Raster(_)) && row_target.is_none() {
         return None;
     }
     let p = crate::pipeline::host_pipeline(pipeline as crate::object::This)?;
@@ -120,19 +132,21 @@ pub(crate) fn begin(
     }
     let page = pages.last_mut()?;
     let index = page.draws.len() as u32;
-    let row = if targets.len() >= 5 {
-        row::Probe::new(targets[0], &page.buffer, index)
-    } else {
-        None
-    };
+    let row = row_target.and_then(|target| row::Probe::new(target, &page.buffer, index));
     if let Some(probe) = &row {
         probe.copy(list, false);
     }
-    let input = input::capture(list, p, heap);
-    let dispatch = input.as_ref().and(args.as_ref()).and_then(|a| a.capture(list));
+    let (args, input, dispatch) = match command {
+        Command::Mesh(args) => {
+            let input = input::capture(list, p, heap);
+            let dispatch = input.as_ref().and(args.as_ref()).and_then(|a| a.capture(list));
+            (args.map(|a| a.address), input, dispatch)
+        }
+        Command::Raster(address) => (address, None, None),
+    };
     page.draws.push(Draw {
         frame,
-        args: args.map(|a| a.address),
+        args,
         target: targets.first().copied().unwrap_or(0),
         depth,
         pipeline: p.name.clone(),
