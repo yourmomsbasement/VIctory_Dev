@@ -5,6 +5,10 @@
 //! vertex and indexed draws such as the game's dynamic decals.
 //! VICTORY_RASTER_STATS accepts comma-separated shader hashes to also measure
 //! raster draws on other surfaces, including depth-only shadow draws.
+//! VICTORY_TRACE_DISPATCH measures the first dispatch of each selected shader
+//! as well as its dispatches on listed frames. Some lighting jobs run only at load.
+//! VICTORY_COMPUTE_MASK=slot+dword@x also reads one R8_UNORM texel at x
+//! on the configured material row before and after those dispatches.
 
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
@@ -27,6 +31,7 @@ struct Draw {
     depth: usize,
     pipeline: String,
     sampled_row: bool,
+    mask_x: Option<u32>,
     input: Option<input::Snapshot>,
     dispatch: Option<input::Counts>,
 }
@@ -99,6 +104,17 @@ pub(crate) struct Active {
 pub(crate) enum Command<'a> {
     Mesh(Option<Arguments<'a>>),
     Raster(Option<u64>),
+    Compute(Option<Arguments<'a>>, Option<(usize, u32)>),
+}
+
+pub(crate) fn compute_pixel() -> Option<(u8, u32, u32)> {
+    static SPEC: OnceLock<Option<(u8, u32, u32)>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let s = std::env::var("VICTORY_COMPUTE_MASK").ok()?;
+        let (view, x) = s.split_once('@')?;
+        let (slot, dword) = view.split_once('+')?;
+        Some((slot.parse().ok()?, dword.parse().ok()?, x.parse().ok()?))
+    })
 }
 
 pub(crate) fn begin(
@@ -113,13 +129,23 @@ pub(crate) fn begin(
         return None;
     }
     let frame = crate::queue::presented() + 1;
-    if !crate::capture::listed(frame) {
+    let listed = crate::capture::listed(frame);
+    if !listed && !matches!(command, Command::Compute(..)) {
         return None;
     }
     // The same material target is bound with six attachments for opaque
     // geometry and decals, then with three for other surface passes.
     let row_target = targets.first().copied().filter(|&target| row::requested(target));
     let p = crate::pipeline::host_pipeline(pipeline as crate::object::This)?;
+    if matches!(command, Command::Compute(..)) {
+        static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+        let mut seen = SEEN.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&p.name) {
+            if !listed { return None }
+        } else {
+            seen.insert(p.name.clone());
+        }
+    }
     if matches!(command, Command::Raster(_)) && row_target.is_none() {
         static SHADERS: OnceLock<Vec<String>> = OnceLock::new();
         let shaders = SHADERS.get_or_init(|| {
@@ -146,7 +172,13 @@ pub(crate) fn begin(
     }
     let page = pages.last_mut()?;
     let index = page.draws.len() as u32;
-    let row = row_target.and_then(|target| row::Probe::new(target, &page.buffer, index));
+    let mask = match &command {
+        Command::Compute(_, output) => *output,
+        _ => None,
+    };
+    let mask_x = mask.map(|(_, x)| x);
+    let row = row_target.or(mask.map(|(r, _)| r))
+        .and_then(|target| row::Probe::new(target, &page.buffer, index, mask_x));
     if let Some(probe) = &row {
         probe.copy(list, false);
     }
@@ -157,14 +189,19 @@ pub(crate) fn begin(
             (args.map(|a| a.address), input, dispatch)
         }
         Command::Raster(address) => (address, None, None),
+        Command::Compute(args, _) => {
+            let dispatch = args.as_ref().and_then(|a| a.capture(list));
+            (args.map(|a| a.address), None, dispatch)
+        }
     };
     page.draws.push(Draw {
         frame,
         args,
-        target: targets.first().copied().unwrap_or(0),
+        target: targets.first().copied().or(mask.map(|(r, _)| r)).unwrap_or(0),
         depth,
         pipeline: p.name.clone(),
-        sampled_row: row.is_some(),
+        sampled_row: row.is_some() && mask_x.is_none(),
+        mask_x: mask_x.filter(|_| row.is_some()),
         input,
         dispatch,
     });
@@ -252,7 +289,7 @@ impl Queries {
         if header {
             let _ = writeln!(
                 out,
-                "frame\targuments\ttarget0\tdepth\tpipeline\tmesh_invocations\tmesh_primitives\tclip_in\tclip_out\tpixel_invocations\tpassed_samples\tchanged_x\theap_input\tdispatch_source_submitted_count"
+                "frame\targuments\ttarget0\tdepth\tpipeline\tmesh_invocations\tmesh_primitives\tclip_in\tclip_out\tpixel_invocations\tpassed_samples\tchanged_x\theap_input\tdispatch_source_submitted_count\tcompute_invocations\tmask_before_after"
             );
         }
         for p in pages.iter() {
@@ -274,7 +311,7 @@ impl Queries {
                     };
                     let _ = writeln!(
                         out,
-                        "{}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         d.frame,
                         d.args.unwrap_or(0),
                         d.target,
@@ -288,7 +325,9 @@ impl Queries {
                         passed,
                         changed,
                         d.input.as_ref().map_or_else(|| "-".into(), input::Snapshot::words),
-                        d.dispatch.as_ref().map_or_else(|| "-".into(), input::Counts::words)
+                        d.dispatch.as_ref().map_or_else(|| "-".into(), input::Counts::words),
+                        s.CSInvocations,
+                        d.mask_x.map_or_else(|| "-".into(), |x| row::mask_pixel(data.cast(), i, x)),
                     );
                 }
                 p.buffer.Unmap(0, None);

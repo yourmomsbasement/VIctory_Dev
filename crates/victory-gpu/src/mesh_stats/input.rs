@@ -22,7 +22,7 @@ pub(super) enum Snapshot {
     },
 }
 
-/// First mesh dispatch record, as written by the title and submitted by the host.
+/// First indirect dispatch record, as written by the title and submitted by the host.
 pub(crate) struct Arguments<'a> {
     pub address: u64,
     pub source: (&'a ID3D12Resource, u64),

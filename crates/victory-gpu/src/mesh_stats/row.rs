@@ -70,10 +70,11 @@ pub(super) struct Probe {
     source: Arc<HostTexture>,
     dest: ID3D12Resource,
     format: DXGI_FORMAT,
+    restore: D3D12_RESOURCE_STATES,
 }
 
 impl Probe {
-    pub(super) fn new(resource: usize, dest: &ID3D12Resource, slot: u32) -> Option<Self> {
+    pub(super) fn new(resource: usize, dest: &ID3D12Resource, slot: u32, compute_x: Option<u32>) -> Option<Self> {
         let row = selected()?;
         let source = crate::resource::host_copy(resource as crate::object::This)?;
         // SAFETY: the host texture is held for both copies.
@@ -87,11 +88,12 @@ impl Probe {
         {
             return None;
         }
-        let format = match desc.Format {
-            DXGI_FORMAT_R8G8B8A8_TYPELESS | DXGI_FORMAT_R8G8B8A8_UNORM => {
+        let format = match (compute_x, desc.Format) {
+            (Some(x), DXGI_FORMAT_R8_UNORM) if x < row.width => DXGI_FORMAT_R8_UNORM,
+            (None, DXGI_FORMAT_R8G8B8A8_TYPELESS | DXGI_FORMAT_R8G8B8A8_UNORM) => {
                 DXGI_FORMAT_R8G8B8A8_UNORM
             }
-            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => desc.Format,
+            (None, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) => desc.Format,
             _ => return None,
         };
         Some(Self {
@@ -100,6 +102,11 @@ impl Probe {
             source,
             dest: dest.clone(),
             format,
+            restore: if compute_x.is_some() {
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            } else {
+                D3D12_RESOURCE_STATE_RENDER_TARGET
+            },
         })
     }
 
@@ -144,11 +151,19 @@ impl Probe {
             list.list
                 .CopyTextureRegion(&dest, 0, 0, 0, &src, Some(&region))
         };
-        list.settle(&self.source, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        list.settle(&self.source, self.restore.0 as u32);
     }
 }
 
 /// The slot must have both copies completed in this mapped page.
+pub(super) unsafe fn mask_pixel(data: *const u8, slot: usize, x: u32) -> String {
+    let row = selected().expect("the captured mask has a configured row");
+    let offset = START as usize + slot * 2 * row.stride as usize + x as usize;
+    // SAFETY: Probe::new checked x against the width of this single-channel row.
+    unsafe { format!("{} {}", *data.add(offset), *data.add(offset + row.stride as usize)) }
+}
+
+/// The slot must have both RGBA row copies completed in this mapped page.
 pub(super) unsafe fn changes(data: *const u8, slot: usize) -> String {
     let r = selected().expect("a captured row has a configured size");
     let start = START as usize + slot * 2 * r.stride as usize;

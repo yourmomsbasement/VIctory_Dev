@@ -405,23 +405,26 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+#[cfg(feature = "diagnostics")]
+fn traced_compute_shader(p: &HostPipeline) -> Option<&str> {
+    static SELECTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let selected = SELECTED.get_or_init(|| std::env::var("VICTORY_TRACE_DISPATCH")
+        .unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect());
+    if selected.is_empty() || !p.compute { return None }
+    p.stages.iter().map(|stage| &stage.shader.hash)
+        .find(|hash| selected.contains(hash)).map(String::as_str)
+}
+
 /// Record the first command of each kind reached by a selected compute
 /// pipeline, including early binding/indirect failures before Dispatch.
 #[cfg(feature = "diagnostics")]
 fn trace_dispatch(p: &HostPipeline, event: &str) {
-    static SELECTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     static SEEN: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-    let selected = SELECTED.get_or_init(|| std::env::var("VICTORY_TRACE_DISPATCH")
-        .unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect());
-    if selected.is_empty() || !p.compute { return }
-    for stage in &p.stages {
-        let hash = &stage.shader.hash;
-        if !selected.contains(hash) { continue }
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if !seen.iter().any(|(s, e)| s == hash && e == event) {
-            seen.push((hash.clone(), event.to_owned()));
-            tracing::info!(shader = %hash, frame = crate::queue::presented() + 1, event, "compute command");
-        }
+    let Some(hash) = traced_compute_shader(p) else { return };
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.iter().any(|(s, e)| s == hash && e == event) {
+        seen.push((hash.to_owned(), event.to_owned()));
+        tracing::info!(shader = %hash, frame = crate::queue::presented() + 1, event, "compute command");
     }
 }
 
@@ -1851,11 +1854,40 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        let query = self.compute_query(list, p, None);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
+        if let Some(q) = query {
+            q.end(list);
+        }
+        #[cfg(feature = "diagnostics")]
         trace_dispatch(p, "recorded Dispatch");
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn compute_query(
+        &self, list: &HostList, p: &HostPipeline, arguments: Option<crate::mesh_stats::Arguments<'_>>,
+    ) -> Option<crate::mesh_stats::Active> {
+        traced_compute_shader(p)?;
+        let output = crate::mesh_stats::compute_pixel().and_then(|(slot, dword, x)| {
+            let used = p.stages.iter().any(|s| s.translated().used.iter().any(|u| {
+                u.root == RootType::Table && u.kind == ResourceType::Uav
+                    && u.slot == slot && u.table_offset_dwords == dword
+            }));
+            if !used { return None }
+            match self.table_view(true, slot, dword)? {
+                crate::descriptor::View::Unordered(resource, _, _) if resource != 0 => Some((resource, x)),
+                _ => None,
+            }
+        });
+        // Compute passes can inherit graphics bindings on the same list.
+        // Those surfaces are unrelated to this dispatch.
+        crate::mesh_stats::begin(
+            list, self.pipeline, crate::mesh_stats::Command::Compute(arguments, output), &[], 0, self.heaps[0],
+        )
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2791,7 +2823,7 @@ impl State {
         });
         let overridden = kind == MESH && self.override_mesh_scissor(list);
         #[cfg(feature = "diagnostics")]
-        let query = if kind == MESH {
+        let query = if kind == MESH || kind == DISPATCH {
             let inputs = crate::mesh_stats::Arguments {
                 address: arguments,
                 source: (&args.buffer, offset),
@@ -2800,11 +2832,13 @@ impl State {
                 max,
                 reused,
             };
-            self.draw_query(list, crate::mesh_stats::Command::Mesh(Some(inputs)))
-        } else if kind == DRAW || kind == INDEXED {
-            self.draw_query(list, crate::mesh_stats::Command::Raster(Some(arguments)))
+            if kind == MESH {
+                self.draw_query(list, crate::mesh_stats::Command::Mesh(Some(inputs)))
+            } else {
+                self.compute_query(list, p, Some(inputs))
+            }
         } else {
-            None
+            self.draw_query(list, crate::mesh_stats::Command::Raster(Some(arguments)))
         };
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
