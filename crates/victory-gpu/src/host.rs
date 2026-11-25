@@ -753,6 +753,8 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) mesh_queries: crate::mesh_stats::Queries,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2664,6 +2666,8 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    list.mesh_queries.save();
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -2863,6 +2867,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                mesh_queries: Default::default(),
             })
         }
     }
@@ -4433,6 +4439,8 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
+        self.mesh_queries.resolve(&self.list);
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
@@ -4452,6 +4460,8 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        #[cfg(feature = "diagnostics")]
+        self.mesh_queries.reset();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();

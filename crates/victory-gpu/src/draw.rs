@@ -235,17 +235,48 @@ impl State {
     }
 }
 
-/// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
-/// they are all widened to the whole target. Grand Theft Auto VI's room at
-/// the start of the prologue lost its walls in five runs of seven, and in
-/// those runs the player's body and the world outside were cut by one
-/// rectangle around the window (run 85, frame 2046): one run with this on
-/// says whether the walls are drawn and cut away by such a rectangle, or
-/// not drawn at all. Off by default: a rectangle the title sets is part of
-/// its picture.
-fn scissor_test() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_SCISSOR_TEST").as_deref() == Ok("full"))
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScissorTest {
+    Off,
+    Full,
+    #[cfg(feature = "diagnostics")]
+    GlobalCycle,
+    #[cfg(feature = "diagnostics")]
+    MeshPasses,
+}
+
+fn scissor_test() -> ScissorTest {
+    static MODE: std::sync::OnceLock<ScissorTest> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_SCISSOR_TEST").as_deref() {
+        Ok("full") => ScissorTest::Full,
+        #[cfg(feature = "diagnostics")]
+        Ok("global-cycle") => ScissorTest::GlobalCycle,
+        #[cfg(feature = "diagnostics")]
+        Ok("mesh-passes") => ScissorTest::MeshPasses,
+        _ => ScissorTest::Off,
+    })
+}
+
+fn apply_scissors(list: &HostList, rects: &[RECT]) {
+    let widen = match scissor_test() {
+        ScissorTest::Full => true,
+        // Start wide during loading. Once the scene has settled, compare
+        // adjacent 32-frame intervals in the same instance of the world.
+        #[cfg(feature = "diagnostics")]
+        ScissorTest::GlobalCycle => crate::capture::frames_in_world()
+            .is_none_or(|age| age < 320 || (age / 32).is_multiple_of(2)),
+        _ => false,
+    };
+    if widen {
+        wide_scissors(list, rects.len());
+    } else {
+        scissors(list, rects);
+    }
+}
+
+fn wide_scissors(list: &HostList, count: usize) {
+    let full = RECT { left: 0, top: 0, right: 16384, bottom: 16384 };
+    scissors(list, &vec![full; count]);
 }
 
 /// An experiment on mesh draws (`VICTORY_MESH_TEST`): 1 for `skip` (none
@@ -612,20 +643,7 @@ impl State {
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
-        if scissor_test() {
-            // The experiment: every rectangle the title sets is widened to
-            // the largest target there is, so nothing is cut by one. What
-            // the listing shows (`op_text`) stays the title's own.
-            let full = RECT {
-                left: 0,
-                top: 0,
-                right: 16384,
-                bottom: 16384,
-            };
-            crate::draw::scissors(list, &vec![full; rects.len()]);
-            return;
-        }
-        crate::draw::scissors(list, rects);
+        apply_scissors(list, rects);
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
@@ -1870,18 +1888,28 @@ impl State {
         text
     }
 
-    /// A mesh draw under `VICTORY_MESH_TEST=scissor` rasterises one pixel:
-    /// the scissors before it (`on`), the title's after it.
-    fn mesh_scissor(&self, list: &HostList, on: bool) {
-        if mesh_test() != 2 {
-            return;
-        }
-        if on {
+    /// Override the rasterizer rectangle for this mesh command only.
+    fn override_mesh_scissor(&self, list: &HostList) -> bool {
+        if mesh_test() == 2 {
             let one = RECT { left: 0, top: 0, right: 1, bottom: 1 };
             crate::draw::scissors(list, &vec![one; self.scissors.len().max(1)]);
-        } else if !self.scissors.is_empty() {
-            crate::draw::scissors(list, &self.scissors);
+            return true;
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            // Alternate eight-frame intervals with the same camera: original,
+            // wide MRT mesh draws, wide depth-only mesh draws, then both.
+            if scissor_test() == ScissorTest::MeshPasses && !self.scissors.is_empty() {
+                let phase = ((crate::queue::presented() + 1) / 8) % 4;
+                if (phase & 1 != 0 && self.targets.len() >= 5)
+                    || (phase & 2 != 0 && self.targets.is_empty() && self.depth != 0)
+                {
+                    wide_scissors(list, self.scissors.len());
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
@@ -1897,10 +1925,18 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
-                    self.mesh_scissor(list, true);
+                    let overridden = self.override_mesh_scissor(list);
+                    #[cfg(feature = "diagnostics")]
+                    let query = crate::mesh_stats::begin(list, self.pipeline, None, &self.targets, self.depth);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
-                    self.mesh_scissor(list, false);
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(q) = query {
+                        q.end(list);
+                    }
+                    if overridden {
+                        apply_scissors(list, &self.scissors);
+                    }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -2667,9 +2703,13 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        if kind == MESH {
-            self.mesh_scissor(list, true);
-        }
+        let overridden = kind == MESH && self.override_mesh_scissor(list);
+        #[cfg(feature = "diagnostics")]
+        let query = if kind == MESH {
+            crate::mesh_stats::begin(list, self.pipeline, Some(arguments), &self.targets, self.depth)
+        } else {
+            None
+        };
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -2682,8 +2722,12 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        if kind == MESH {
-            self.mesh_scissor(list, false);
+        #[cfg(feature = "diagnostics")]
+        if let Some(q) = query {
+            q.end(list);
+        }
+        if overridden {
+            apply_scissors(list, &self.scissors);
         }
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {

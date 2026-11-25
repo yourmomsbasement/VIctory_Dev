@@ -123,6 +123,10 @@ fn world_on() -> bool {
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+pub(crate) fn frames_in_world() -> Option<u64> {
+    (crate::queue::presented() + 1).checked_sub(WORLD.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
