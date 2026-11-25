@@ -579,7 +579,14 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        let format = if f.Format == DXGI_FORMAT_R16_TYPELESS
+            && d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        {
+            DXGI_FORMAT_D16_UNORM
+        } else {
+            f.Format
+        };
+        if let Some(rgba) = to_rgba(format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
@@ -727,7 +734,19 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
-        55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
+        55 => {
+            // D16 depth uses the full unsigned range. Keep its scale across
+            // captures, including maps entirely cleared to the far plane.
+            for y in 0..h {
+                for x in 0..w {
+                    let depth = u32::from(u16_at(px(x, y, 2), 0));
+                    let grey = ((depth * 255 + 32767) / 65535) as u8;
+                    out.extend([grey, grey, grey, 255]);
+                }
+            }
+            return Some(out);
+        }
+        56..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
         60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
         _ => return None,
     };
@@ -969,6 +988,11 @@ mod tests {
     /// not B8G8R8A8.
     #[test]
     fn unorm16_and_xr_bias_targets_decode_as_their_formats() {
+        // A restricted depth range keeps its absolute values across maps.
+        assert_eq!(
+            super::to_rgba(55, 2, 1, 4, &[0, 0x40, 0, 0x80]),
+            Some(vec![64, 64, 64, 255, 128, 128, 128, 255])
+        );
         // Red 0x8000 (a half-float -0), green 0x4000, blue 0.
         let unorm16 = [0x00, 0x80, 0x00, 0x40, 0, 0, 0xff, 0xff];
         assert_eq!(super::to_rgba(11, 1, 1, 8, &unorm16), Some(vec![255, 127, 0, 255]));

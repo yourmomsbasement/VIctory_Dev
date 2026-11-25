@@ -3,6 +3,8 @@
 //! VICTORY_MATERIAL_ROW=1280x720@160 also records which pixels each material
 //! draw changes along row 160 of its first color target, including ordinary
 //! vertex and indexed draws such as the game's dynamic decals.
+//! VICTORY_RASTER_STATS accepts comma-separated shader hashes to also measure
+//! raster draws on other surfaces, including depth-only shadow draws.
 
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
@@ -117,10 +119,22 @@ pub(crate) fn begin(
     // The same material target is bound with six attachments for opaque
     // geometry and decals, then with three for other surface passes.
     let row_target = targets.first().copied().filter(|&target| row::requested(target));
-    if matches!(command, Command::Raster(_)) && row_target.is_none() {
-        return None;
-    }
     let p = crate::pipeline::host_pipeline(pipeline as crate::object::This)?;
+    if matches!(command, Command::Raster(_)) && row_target.is_none() {
+        static SHADERS: OnceLock<Vec<String>> = OnceLock::new();
+        let shaders = SHADERS.get_or_init(|| {
+            std::env::var("VICTORY_RASTER_STATS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        });
+        if !p.stages.iter().any(|stage| shaders.contains(&stage.shader.hash)) {
+            return None;
+        }
+    }
     let mut pages = list
         .mesh_queries
         .0
