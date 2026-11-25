@@ -683,8 +683,8 @@ fn the_world_builder_resets_only_the_requested_counter_records() {
 #[ignore = "requires VICTORY_TEST_BVH_BUILDER pointing to the title's builder DLL"]
 fn the_world_builder_copies_for_update_and_optionally_resets_bounds() {
     let shader = builder_stage(b"DXBC\x60\xa9\x39\x6f\xb6\x2c\x89\xfe\xa9\x9b\x32\x73\x72\xe9\xdd\x9e");
-    assert_eq!(shader.root_srvs, [0]);
-    assert_eq!(shader.root_uavs, [1]);
+    assert!(shader.root_srvs.is_empty());
+    assert_eq!(shader.root_uavs, [0, 1]);
     assert!(shader.root_cbvs.is_empty());
     let mut source: Vec<u32> = (0..304).map(|i| 0x1234_0000 + i).collect();
     source[1] = 17; // 64-byte header + 17 nodes, followed by a guard
@@ -692,7 +692,8 @@ fn the_world_builder_copies_for_update_and_optionally_resets_bounds() {
     for warp in [true, false] {
         let host = Host::new(warp).expect("adapter");
         let (root, pso) = host.compute_pipeline(&shader).expect("update pipeline");
-        for reset in [false, true] {
+        // In the captured in-place updates the reset flag is clear.
+        for (in_place, reset) in [(false, false), (false, true), (true, false)] {
             let mut constants = vec![0; shader.user_data_dwords() as usize];
             for u in &shader.user_data {
                 constants[u.index as usize] = match (u.slot, u.root, u.dword) {
@@ -702,20 +703,221 @@ fn the_world_builder_copies_for_update_and_optionally_resets_bounds() {
                     other => panic!("unexpected update argument {other:?}"),
                 };
             }
+            let mut views = vec![View::RawUavData(&source)];
+            let dest = if in_place { 0 } else { 1 };
+            if !in_place {
+                views.push(View::RawUav(source.len() as u32));
+            }
             let out = host.dispatch(&root, &pso, &Dispatch {
-                roots: vec![(0, Root::Constants(constants)), (1, Root::View { srv: true, data: source.clone() }),
-                            (2, Root::Uav(0))],
-                views: &[View::RawUav(source.len() as u32)], samplers: &[], groups: [2, 1, 1],
+                roots: vec![(0, Root::Constants(constants)), (1, Root::Uav(0)), (2, Root::Uav(dest))],
+                views: &views, samplers: &[], groups: [2, 1, 1],
             }).expect("copy for update");
             let mut want = source.clone();
-            want[end..].fill(0);
+            if !in_place {
+                want[end..].fill(0);
+            }
             if reset {
                 want[4..7].fill(f32::MAX.to_bits());
                 want[7..10].fill((-f32::MAX).to_bits());
             }
-            assert_eq!(out[0], want, "copy for update, reset={reset}");
+            assert_eq!(out[0], source, "source");
+            assert_eq!(out[dest], want, "copy for update, in_place={in_place}, reset={reset}");
         }
     }
+}
+
+#[test]
+#[ignore = "requires VICTORY_TEST_BVH_BUILDER pointing to the title's builder DLL"]
+fn the_world_builder_reloads_a_triangle_and_refits_its_parent() {
+    let shader =
+        builder_stage(b"DXBC\x76\x4a\x42\xe1\x0a\xef\x76\x6b\x09\x5b\x4e\x36\x8d\x83\x3c\x4f");
+    assert_eq!(shader.root_srvs, [super::SLOT_MEMORY]);
+    let mut slots = shader.root_uavs.clone();
+    slots.sort_unstable();
+    assert_eq!(slots, [4, 5, super::SLOT_FAULTS]);
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        constants[u.index as usize] = match (u.slot, u.root, u.dword) {
+            (8, RootType::Constants, 12) => 5, // update without reducing bounds
+            (8, RootType::Constants, _) | (4 | 5, RootType::Other(super::USER_VIEW_BIAS), _) => 0,
+            (_, RootType::Other(super::USER_MEMORY_BASE), _) => 0,
+            other => panic!("unexpected reload argument {other:?}"),
+        };
+    }
+    const NODE: usize = 16;
+    const PARENT: usize = 32;
+    const LINKS: usize = 64;
+    let mut structure = vec![0; LINKS + 2 + 8]; // header, leaf, box, parent links, guard
+    structure[0] = 1 << 31; // bottom-level structure
+    structure[3] = 1;
+    structure[13] = 4 * NODE as u32;
+    structure[14] = 4 * LINKS as u32;
+    // Geometry record 1, triangle 0, no paired triangle. Pack the
+    // vertex slots so the first three corners end up in input order.
+    structure[NODE + 12..NODE + 16].copy_from_slice(&[1 << 8, 0, u32::MAX, 9]);
+    structure[PARENT..PARENT + 4].copy_from_slice(&[8, u32::MAX, u32::MAX, u32::MAX]);
+    structure[LINKS..LINKS + 2].copy_from_slice(&[2 << 3 | 5, u32::MAX]); // box32, then root
+    structure[LINKS + 2..].fill(0xabcd_4321);
+    let mut geometry = vec![0; 16];
+    geometry[8] = 0x10010; // vertices on guest page 1, 16 bytes into it
+    geometry[14] = 12; // tightly packed xyz
+    geometry[15] = 6; // R32G32B32_FLOAT, implicit consecutive indices
+    let xyz = [-1.0f32, 2.0, 3.0, 4.0, -5.0, 6.0, 7.0, 8.0, -9.0].map(f32::to_bits);
+    let mut vertices = vec![0; 4];
+    vertices.extend_from_slice(&xyz);
+    let mut want = structure.clone();
+    want[NODE..NODE + 9].copy_from_slice(&xyz);
+    // This native program requires wave32.
+    let host = Host::new(false).expect("wave32 hardware");
+    let (root, pso) = host.compute_pipeline(&shader).expect("reload pipeline");
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(constants)),
+                    (1, Root::Uav(0)),
+                    (2, Root::Uav(2)),
+                    (3, Root::Uav(3)),
+                    (
+                        4,
+                        Root::View {
+                            srv: true,
+                            data: vec![0, 0, 1, 0],
+                        },
+                    ),
+                ],
+                views: &[
+                    View::RawUavData(&structure),
+                    View::RawUavData(&vertices),
+                    View::RawUavData(&geometry),
+                    View::RawUav(super::MEMORY_FAULTS),
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("reload triangle");
+    for (i, word) in out[0].iter().enumerate() {
+        if (NODE + 9..NODE + 12).contains(&i) {
+            assert!(
+                f32::from_bits(*word).is_nan(),
+                "absent fourth corner, word {i}: {word:x}"
+            );
+        } else {
+            assert_eq!(*word, want[i], "triangle structure word {i}");
+        }
+    }
+    assert_eq!(out[1], vertices);
+    assert_eq!(out[2], geometry);
+    assert!(
+        out[3].iter().all(|word| *word == 0),
+        "a vertex page was missing"
+    );
+    check_triangle_refit(&host, &out[0], PARENT, NODE);
+}
+
+fn check_triangle_refit(host: &Host, leaf_structure: &[u32], parent: usize, leaf: usize) {
+    // Pass exactly the reloaded bytes to the game's bottom-up refit.
+    let refit =
+        builder_stage(b"DXBC\x40\x2d\x99\x6d\x17\xd7\x90\x7c\xfa\xe6\x7c\xdc\x8e\xc2\x03\xcb");
+    let mut constants = vec![0; refit.user_data_dwords() as usize];
+    for u in &refit.user_data {
+        constants[u.index as usize] = match (u.slot, u.root, u.dword) {
+            (8, RootType::Constants, i) => [2, 0x3f80_a3d7, u32::MAX][i as usize],
+            (0 | 1, RootType::Other(super::USER_VIEW_BIAS), _) => 0,
+            (_, RootType::Other(super::USER_MEMORY_BASE), _) => 0,
+            other => panic!("unexpected refit argument {other:?}"),
+        };
+    }
+    let (root, pso) = host.compute_pipeline(&refit).expect("refit pipeline");
+    let refitted = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(constants)),
+                    (1, Root::Uav(0)),
+                    (2, Root::Uav(1)),
+                    (3, Root::Uav(2)),
+                    (
+                        4,
+                        Root::View {
+                            srv: true,
+                            data: vec![0, 0],
+                        },
+                    ),
+                ],
+                views: &[
+                    View::RawUavData(leaf_structure),
+                    View::RawUav(4),
+                    View::RawUav(super::MEMORY_FAULTS),
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("refit reloaded leaf");
+    let bounds = [-1.0f32, -5.0, -9.0, 7.0, 8.0, 6.0].map(f32::to_bits);
+    let mut want = leaf_structure.to_vec();
+    want[4..10].copy_from_slice(&bounds);
+    want[parent + 4..parent + 10].copy_from_slice(&bounds);
+    assert_eq!(refitted[0], want, "parent box and header bounds");
+    assert_eq!(refitted[1], [0, 1, 0, 0], "one child reached the parent");
+    assert!(refitted[2].iter().all(|word| *word == 0));
+    trace_refitted_triangle(host, &refitted[0], parent, leaf);
+}
+
+/// Run the translated node instruction on the builder's actual output.
+fn trace_refitted_triangle(host: &Host, structure: &[u32], parent: usize, leaf: usize) {
+    let scene = Scene {
+        words: structure.to_vec(),
+        starts: vec![parent, leaf],
+    };
+    let hit = Ray::new([2.25, 1.75, -3.25], [0.0, 0.0, 1.0], 10.0);
+    let inside_box = Ray::new([6.0, -4.0, -3.25], [0.0, 0.0, 1.0], 10.0);
+    let outside_box = Ray::new([32.0, 32.0, -3.25], [0.0, 0.0, 1.0], 10.0);
+    let (shader, _) = build(true, Descriptor::Table).expect("node instruction");
+    let (root, pipeline) = host.compute_pipeline(&shader).expect("traversal pipeline");
+    let trace = |batch: &[Case]| {
+        let data = buffer(&scene, batch, u64::from(NODES));
+        host.dispatch(
+            &root,
+            &pipeline,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; 5]))],
+                views: &[
+                    View::Buffer {
+                        data: &data,
+                        stride: Stride::Raw,
+                    },
+                    View::RawUav(4 * THREADS),
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("trace refitted structure")
+        .remove(0)
+    };
+    let children = trace(&[
+        Some((0, 5, hit)),
+        Some((0, 5, inside_box)),
+        Some((0, 5, outside_box)),
+    ]);
+    assert_eq!(
+        &children[..4],
+        &[scene.pointer(1, 0), bvh::NONE, bvh::NONE, bvh::NONE]
+    );
+    assert_eq!(&children[4..8], &children[..4]);
+    assert_eq!(&children[8..12], &[bvh::NONE; 4]);
+    let kind = bvh::kind(u64::from(children[0]));
+    let leaf_hits = trace(&[Some((1, kind, hit)), Some((1, kind, inside_box))]);
+    let [t, det, v, w] = std::array::from_fn(|i| f32::from_bits(leaf_hits[i]));
+    assert_eq!([t / det, v / det, w / det], [4.0, 0.25, 0.25]);
+    assert_eq!(&leaf_hits[4..8], &bvh::MISS.map(f32::to_bits));
 }
 
 #[test]

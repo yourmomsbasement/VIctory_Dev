@@ -6216,6 +6216,16 @@ impl<'a> Lower<'a> {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
+                        // The builder can pass the same storage as both input
+                        // and output (in-place structure updates). A D3D12
+                        // buffer cannot be in SRV and UAV states at once.
+                        if crate::spill::is_spilled(self.x.native)
+                            && self.x.native.used.iter().any(|u| {
+                                u.root == RootType::Descriptor && u.kind == ResourceType::Uav
+                            })
+                        {
+                            return Ok(self.s.root_uav_handle(rp.slot));
+                        }
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
                     // A root UAV: a raw buffer whether the access reads

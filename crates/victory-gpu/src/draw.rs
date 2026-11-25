@@ -194,8 +194,8 @@ pub(crate) struct State {
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
-    /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// Root UAVs bound as one-view tables, keyed also by their byte limit.
+    root_uav_slots: std::collections::HashMap<(usize, u64, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
 }
@@ -1079,7 +1079,10 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                let input = t.used.iter().any(|u| {
+                    u.slot == slot && u.root == RootType::Descriptor && u.kind == ResourceType::Srv
+                });
+                if !self.root_uav(list, address, param, compute, writes, input) {
                     return false;
                 }
             }
@@ -1092,15 +1095,15 @@ impl State {
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
     /// host copy from `address` on, as a one-view table (a null view
-    /// without an address, without a host copy shaders can write, or at an
-    /// address not on 16 bytes), or as a root descriptor with
+    /// without an address or a host copy supporting unordered access),
+    /// or as a root descriptor with
     /// `VICTORY_ROOT_SRV_DIRECT=1` (the dispatch is dropped then if there
     /// is nothing to bind). With `writes`, what the shader stored is copied
     /// back into title memory when the list has run. False if the draw
     /// must be dropped.
     /// shortcut: a root view has no size: the view, the refresh and the
     /// copy back cover all that is left of the title's buffer
-    /// (`VICTORY_ROOT_UAV_MB` sets a limit for all three).
+    /// (`VICTORY_ROOT_UAV_MB` sets a limit for the title's UAVs).
     fn root_uav(
         &mut self,
         list: &HostList,
@@ -1108,6 +1111,7 @@ impl State {
         param: u32,
         compute: bool,
         writes: bool,
+        input: bool,
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1117,6 +1121,9 @@ impl State {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map_or(u64::MAX, |mb| mb << 20)
         });
+        // A builder input shares the UAV state with a possible output
+        // alias, but retains the title SRV's full readable range.
+        let limit = if input { u64::MAX } else { limit };
         let find = |a: u64| {
             let s = crate::shadow::find(a, 1)?;
             // SAFETY: a live buffer.
@@ -1130,7 +1137,7 @@ impl State {
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
-            if writes {
+            if writes && !input {
                 s.gpu_writes(list, a, len);
             }
         };
@@ -1162,7 +1169,7 @@ impl State {
             once!("a root UAV without a bound view heap: the draw is dropped");
             return false;
         };
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0), limit);
         let (index, shadow) = match self.root_uav_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
