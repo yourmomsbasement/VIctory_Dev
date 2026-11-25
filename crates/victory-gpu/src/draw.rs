@@ -952,6 +952,8 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             self.trace_buffer_views(stage, &made, compute);
+            #[cfg(feature = "diagnostics")]
+            self.trace_texture_record(stage, compute);
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
@@ -2198,6 +2200,75 @@ impl State {
             tracing::info!(frame, shader = %stage.shader.hash, slot = u.slot, dword = u.table_offset_dwords,
                 index, binding, address, size, offset = shadow.offset(address), stride = u.stride,
                 "shader buffer binding");
+        }
+    }
+
+    /// At captured frames, read the material's texture indices from title
+    /// memory and report both the requested view and the actual host resource.
+    /// Each comma-separated VICTORY_TRACE_TEXTURE_RECORDS entry specifies
+    /// shader:table-slot:table-dword:constant-slot:constant-dword:word-count.
+    #[cfg(feature = "diagnostics")]
+    fn trace_texture_record(&self, stage: &crate::pipeline::host::Stage, compute: bool) {
+        struct Record {
+            shader: String,
+            table: u8,
+            entry: u32,
+            constant: u8,
+            dword: usize,
+            words: usize,
+        }
+        static RECORDS: std::sync::OnceLock<Vec<Record>> = std::sync::OnceLock::new();
+        let records = RECORDS.get_or_init(|| {
+            std::env::var("VICTORY_TRACE_TEXTURE_RECORDS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|spec| {
+                    let mut fields = spec.trim().split(':');
+                    let record = Record {
+                        shader: fields.next()?.to_owned(),
+                        table: fields.next()?.parse().ok()?,
+                        entry: fields.next()?.parse().ok()?,
+                        constant: fields.next()?.parse().ok()?,
+                        dword: fields.next()?.parse().ok()?,
+                        words: fields.next()?.parse().ok()?,
+                    };
+                    (fields.next().is_none() && (1..=64).contains(&record.words)).then_some(record)
+                })
+                .collect()
+        });
+        let Some(record) = records.iter().find(|r| r.shader == stage.shader.hash) else { return };
+        let frame = crate::queue::presented() + 1;
+        if !crate::capture::listed(frame) || self.heaps[0] == 0 {
+            return;
+        }
+        let Some(Root::Constants(values)) = self.roots_ref(compute).get(usize::from(record.constant)) else { return };
+        let Some(&offset) = values.get(record.dword) else { return };
+        let Some(view) = self.table_view(compute, record.table, record.entry) else { return };
+        let Some((base, bytes)) = crate::descriptor::host::backed_view_range(&view) else { return };
+        let mut data = vec![0; record.words * 4];
+        if u64::from(offset) + data.len() as u64 > bytes {
+            return;
+        }
+        let Some(address) = base.checked_add(u64::from(offset)) else { return };
+        if !crate::host::read_into(address as *const u8, &mut data) {
+            return;
+        }
+        let heap = crate::descriptor::heap(self.heaps[0] as This);
+        let Some(host) = heap.host() else { return };
+        for (word, bytes) in data.chunks_exact(4).enumerate() {
+            let index = u32::from_le_bytes(bytes.try_into().unwrap());
+            let Some(view @ View::Placed(false, resource, desc)) =
+                heap.handle(index).and_then(crate::descriptor::view)
+            else { continue };
+            if resource[0] == 1 {
+                continue;
+            }
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let pages = crate::resource::placed_bytes(&resource)
+                .and_then(|len| crate::texture::trace_readable_pages(address, len));
+            let shape = host.bound_shape(index);
+            tracing::info!(frame, shader = %record.shader, offset, word, index, ?shape, ?pages,
+                requested = %describe(Some(&view)), "material texture record");
         }
     }
 

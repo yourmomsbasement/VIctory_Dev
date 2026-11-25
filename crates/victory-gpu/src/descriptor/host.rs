@@ -1364,6 +1364,16 @@ impl HostHeap {
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 
+    /// Dimensions and format of the resource the shader-visible slot holds.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bound_shape(&self, index: u32) -> Option<(u64, u32, i32)> {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let resource = kept.get(index as usize)?.as_ref()?;
+        // SAFETY: the slot holds the resource while its description is read.
+        let desc = unsafe { resource.GetDesc() };
+        Some((desc.Width, desc.Height, desc.Format.0))
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.

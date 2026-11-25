@@ -856,6 +856,17 @@ fn by_query() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
 }
 
+/// Count readable pages throughout a traced material texture, including
+/// interior mips when both ends are unmapped. Bound the cost of each probe.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_readable_pages(address: u64, len: u64) -> Option<(usize, usize)> {
+    if address == 0 || !(1..=16 << 20).contains(&len) {
+        return None;
+    }
+    address.checked_add(len)?;
+    Some(readable(usize::try_from(address).ok()?, len as usize, false))
+}
+
 /// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
 /// can be read, and how many there are; with `all`, it stops at the first
 /// that cannot. One question to the kernel for up to 256 pages at once
