@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::resource::ResourceDesc;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -107,7 +108,7 @@ pub(crate) struct Spans {
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    sizes: std::collections::HashMap<ResourceDesc, Option<u64>>,
 }
 
 type SpanSlots = std::collections::BTreeMap<(u64, u64), std::collections::BTreeSet<u32>>;
@@ -116,11 +117,12 @@ impl Spans {
     /// The bytes of title memory a placed texture with the resource
     /// description `desc` takes (`crate::resource::placed_bytes`).
     fn bytes(&mut self, desc: &[u32; 14]) -> Option<u64> {
-        if let Some(&known) = self.sizes.get(desc) {
+        let key = ResourceDesc::from_words(desc);
+        if let Some(&known) = self.sizes.get(&key) {
             return known;
         }
         let bytes = crate::resource::placed_bytes(desc);
-        self.sizes.insert(*desc, bytes);
+        self.sizes.insert(key, bytes);
         bytes
     }
 
@@ -2154,7 +2156,8 @@ fn keep_views() -> bool {
 fn same_placed_texture(a: &View, b: &View) -> bool {
     match (a, b) {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
-            resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
+            resource[0] != 1 && desc[10..12] == other_desc[10..12]
+                && ResourceDesc::from_words(resource) == ResourceDesc::from_words(other)
         }
         _ => false,
     }
@@ -2415,6 +2418,10 @@ mod tests {
         let low = view(texture, 3, 0x1000_0000);
         // more mips of the same texture
         assert!(same_placed_texture(&low, &view(texture, 0, 0x1000_0000)));
+        let mut padded = texture;
+        padded[1] = 32764;
+        padded[13] = 32764;
+        assert!(same_placed_texture(&low, &view(padded, 0, 0x1000_0000)));
         // another address, another description, a buffer, an unordered view
         assert!(!same_placed_texture(&low, &view(texture, 3, 0x2000_0000)));
         let mut wider = texture;

@@ -83,7 +83,7 @@ pub(crate) struct HeapDesc {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ResourceDesc {
     dimension: u32,
     alignment: u64,
@@ -108,6 +108,16 @@ pub(crate) struct AllocationInfo {
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
+
+#[cfg(windows)]
+impl ResourceDesc {
+    /// Decode the ABI fields before comparing resources. Bytes 4..8 and
+    /// 52..56 are padding and can differ between descriptions of one texture.
+    pub(crate) fn from_words(words: &[u32; 14]) -> Self {
+        // SAFETY: ResourceDesc is repr(C), is 56 bytes, and contains only integers.
+        unsafe { words.as_ptr().cast::<Self>().read_unaligned() }
+    }
+}
 
 const BUFFER: u32 = 1;
 const TEXTURE_3D: u32 = 4;
@@ -2058,7 +2068,7 @@ pub(crate) extern "system" fn create_at_address(
 /// its host texture is let go when nothing names it any more
 /// ([`let_go_idle`]) and made again on the next use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, ResourceDesc), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The bytes of title memory a texture with the resource description
@@ -2066,8 +2076,7 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
 /// and for a description without a size.
 #[cfg(windows)]
 pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
-    // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let d = ResourceDesc::from_words(desc);
     if d.dimension == BUFFER {
         return None;
     }
@@ -2078,7 +2087,8 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 /// extending the residency of an otherwise unused placed texture.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_copy(address: u64, desc: &[u32; 14]) -> Option<std::sync::Arc<HostTexture>> {
-    let object = *PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).get(&(address, *desc))?;
+    let key = (address, ResourceDesc::from_words(desc));
+    let object = *PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).get(&key)?;
     hosted(object as This, false).map(|(copy, _)| copy)
 }
 
@@ -2086,12 +2096,11 @@ pub(crate) fn placed_copy(address: u64, desc: &[u32; 14]) -> Option<std::sync::A
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let d = ResourceDesc::from_words(desc);
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&r) = map.get(&(address, *desc)) {
+    if let Some(&r) = map.get(&(address, d)) {
         return Some(r as This);
     }
-    // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
     }
@@ -2108,7 +2117,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
+    map.insert((address, d), out as usize);
     resource(out)
         .host
         .placed
@@ -2390,8 +2399,15 @@ mod tests {
             let placed = [3, 0, 0, 0, 4, 0, 4, (mips << 16) | 1, 67, 1, 0, 0, 0, 0];
             let view = texture_at(address, &placed).expect("placed light atlas");
             let source = alias_of(view);
+            // Two copies made by the title can have different ABI padding.
+            for (leading, trailing) in [(32764, 0), (0, 32764)] {
+                let mut rewritten = placed;
+                rewritten[1] = leading;
+                rewritten[13] = trailing;
+                assert_eq!(texture_at(address, &rewritten), Some(view));
+            }
             // End the test's cached view before its backing allocation goes away.
-            PLACED_TEXTURES.lock().unwrap().remove(&(address, placed));
+            PLACED_TEXTURES.lock().unwrap().remove(&(address, ResourceDesc::from_words(&placed)));
             assert_eq!(slot::<Release>(view, 0x10)(view), 0);
             assert_eq!(source, expected);
         }

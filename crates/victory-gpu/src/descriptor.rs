@@ -1194,8 +1194,17 @@ mod tests {
         crate::draw::State::heap_textures(&list, heap, mirror, 11);
         assert_eq!(mirror.bound_shape(1), Some((4, 4, 28)));
         let image = crate::resource::texture_at(address, &shape).unwrap();
+        // A fresh description of the streamed mip can carry different ABI
+        // padding. Rebuild the actual descriptor and check it still shows the
+        // populated host texture before reading those texels back.
+        let mut rewritten = shape;
+        rewritten[1] = 32764;
+        rewritten[13] = 32764;
+        create_placed_srv(null, &rewritten, &desc, handle);
+        assert!(mirror.mirror(1, handle, true).is_some());
         crate::list::ensure_state(&list, image, 0x800);
         let tex = crate::resource::host_resource(image).unwrap();
+        assert_eq!(mirror.shows(1, tex), Some(true));
         let (readback, layout) = crate::capture::read_back(&device.device, &list.list, tex).unwrap();
         list.close();
         device.execute(&[&list]);
