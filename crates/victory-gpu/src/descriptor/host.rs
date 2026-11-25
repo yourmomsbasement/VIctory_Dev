@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -68,7 +68,9 @@ pub(crate) struct HostHeap {
     /// are due: such a texture is uploaded when a draw reads it through a
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
-    textures: Mutex<TextureQueue>,
+    pub(crate) textures: Arc<Mutex<TextureQueue>>,
+    /// Last frame (plus one) in which either kind of bindless shader serviced the queue.
+    pub(crate) texture_frame: std::sync::atomic::AtomicU64,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -278,6 +280,8 @@ fn tabled_out() -> bool {
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
+    /// A shader actually sampled this slot while the texture was pending.
+    sampled: bool,
     /// The frame from which the slot is due.
     due: u64,
     /// The frame it was written in.
@@ -313,16 +317,23 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { sampled: false, due, written: frame, write, looks: 0, mapped: 0 });
     }
 
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
     }
 
+    /// A sampled slot moves ahead of speculative uploads if it is pending.
+    /// Its current descriptor generation and retry state remain authoritative.
+    pub(crate) fn sampled(&mut self, index: u32) -> bool {
+        self.slots.get_mut(&index).is_some_and(|w| !std::mem::replace(&mut w.sampled, true))
+    }
+
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
+    /// - first the textures actually sampled, oldest due first;
+    /// - then the ones looked at before (their memory was not mapped, or
     ///   only part of it): the look is a query, and memory that has
     ///   arrived since is what the title streamed in last;
     /// - then the others, the newest write first and the oldest next, in
@@ -331,9 +342,14 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let mut sampled = Vec::new();
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+            if w.sampled {
+                sampled.push((w.due, w.write, index));
+                continue;
+            }
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((w.written, index, w.write));
         }
@@ -341,7 +357,9 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        sampled.sort_unstable();
+        let mut order: Vec<(u32, u64)> = sampled.into_iter().map(|(_, write, index)| (index, write)).collect();
+        order.extend(again.iter().map(|&(_, index, write)| (index, write)));
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
             order.push((fresh[new].1, fresh[new].2));
@@ -392,7 +410,8 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        let sampled = self.slots.get(&index).is_some_and(|w| w.sampled);
+        self.slots.insert(index, Waiting { sampled, due, written: frame, write, looks: 0, mapped: 0 });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -665,7 +684,8 @@ impl HostHeap {
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
-            textures: Mutex::default(),
+            textures: Arc::default(),
+            texture_frame: Default::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -2437,11 +2457,28 @@ mod tests {
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
     }
 
-    /// The queue of textures picked by index serves the slots looked at
-    /// before first, then the newest write and the oldest in turns; a
-    /// slot whose memory is not there is looked at again after
-    /// 1, 2, 4 frames up to the limit; and what the pass reports about a
-    /// slot written again meanwhile is dropped.
+    #[test]
+    fn sampled_texture_retries_without_another_descriptor_write() {
+        let mut q = TextureQueue::default();
+        for slot in 0..5 { q.written(slot, 1, 1, false); }
+        assert!(q.sampled(2));
+        let (slot, write) = q.due(1, 1)[0];
+        assert_eq!(slot, 2);
+        q.partly(slot, write, 2, 256);
+        q.later(slot, write, 2, 16);
+        assert!(!q.sampled(slot));
+        assert_ne!(q.due(2, 1)[0].0, slot);
+        assert_eq!(q.due(3, 1), [(slot, write)]);
+        assert_eq!(q.mapped(slot), 256);
+        q.changed(slot, 3, 4);
+        q.done(slot, write);
+        let (same_slot, next_write) = q.due(4, 1)[0];
+        assert_eq!(same_slot, slot);
+        assert_ne!(next_write, write);
+        q.done(slot, next_write);
+        assert!(!q.sampled(slot));
+    }
+
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();

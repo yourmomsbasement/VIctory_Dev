@@ -113,7 +113,7 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_FAULT_SUMMARY, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_TABLE_STRUCTURE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_TEXTURE_READS, USER_DATA_SPACE, USER_MEMORY_BASE, USER_TABLE_STRUCTURE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit,
 };
 
@@ -233,6 +233,26 @@ pub struct UserData {
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,
+}
+
+thread_local! {
+    static TEXTURE_FEEDBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn with_texture_feedback<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEXTURE_FEEDBACK.set(self.0);
+        }
+    }
+    let _restore = Restore(TEXTURE_FEEDBACK.replace(true));
+    f()
+}
+
+/// Translate for a host that binds the sampled-texture bitmap when requested.
+pub fn translate_with_texture_feedback(container: &[u8]) -> Result<HostShader, ShaderError> {
+    with_texture_feedback(|| translate(container))
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console

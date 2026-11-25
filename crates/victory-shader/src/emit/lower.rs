@@ -6351,9 +6351,7 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
-                let h = self
-                    .s
-                    .heap_handle(self.cur, index, sampler, per_lane, props);
+                let h = self.descriptor_handle(src, index, sampler, per_lane, props);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -6424,7 +6422,7 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                Ok(self.descriptor_handle(src, phi, sampler, false, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -6442,16 +6440,58 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.descriptor_handle(src, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
-                Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
+                Ok(self.descriptor_handle(src, index, sampler, true, props))
             }
         }
+    }
+
+    /// Mark texture SRVs whose slot is selected from the resource heap. A
+    /// mixed table/heap choice uses its final index; the host only promotes
+    /// pending title slots. Each active lane can select a different texture.
+    fn descriptor_handle(
+        &mut self,
+        src: &Source,
+        index: V,
+        sampler: bool,
+        per_lane: bool,
+        props: (u32, u32),
+    ) -> V {
+        if !sampler
+            && (1..=9).contains(&props.0)
+            && super::TEXTURE_FEEDBACK.get()
+            && src.leaves().iter().any(|leaf| match leaf {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => self.scalar
+                    .get(load)
+                    .and_then(|a| self.x.native.layout.get(a.param))
+                    .is_some_and(|p| p.root == RootType::ResourceHeap),
+                _ => false,
+            })
+        {
+            let c = self.cur;
+            let bitmap = self.s.root_uav_handle(super::SLOT_TEXTURE_READS);
+            let i32t = self.s.t.i32;
+            let last = self.s.m.i32(super::SLOT_STRIDES_COUNT - 1);
+            let bounded = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+            let (five, two) = (self.s.m.i32(5), self.s.m.i32(2));
+            let (mask, one) = (self.s.m.i32(31), self.s.m.i32(1));
+            let word = self.s.m.bin(c, Bin::LShr, bounded, five);
+            let byte = self.s.m.bin(c, Bin::Shl, word, two);
+            let shift = self.s.m.bin(c, Bin::And, bounded, mask);
+            let bit = self.s.m.bin(c, Bin::Shl, one, shift);
+            let valid = self.s.m.cmp(c, pred::EQ, index, bounded);
+            let zero = self.s.m.i32(0);
+            let bit = self.s.m.select(c, valid, bit, zero);
+            let iu = self.s.m.undef(i32t);
+            self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[bitmap, two, byte, iu, iu, bit]);
+        }
+        self.s.heap_handle(self.cur, index, sampler, per_lane, props)
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its

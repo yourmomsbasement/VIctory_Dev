@@ -142,6 +142,10 @@ fn heap_texture_dimensions_are_available_without_sampling() {
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with_view_root(words, buffers, RootType::Table)
+}
+
+fn build_with_view_root(words: &[u32], buffers: bool, view_root: RootType) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -169,7 +173,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
-        layout: vec![table(0), table(1)],
+        layout: vec![RootParam { root: view_root, ..table(0) }, table(1)],
         used: vec![
             views,
             range(ResourceType::Uav, 16, 4, 0, 0),
@@ -454,6 +458,40 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
         // Even lanes hold entry 0's offset, odd lanes entry 1's.
         let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
         assert_eq!(red, want, "{label}");
+    }
+}
+
+#[test]
+fn sampled_bindless_texture_indices_reach_the_feedback_bitmap() {
+    use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
+    let shader = super::with_texture_feedback(|| {
+        build_with_view_root(WATERFALL_INDEXED_WAVE32, false, RootType::ResourceHeap)
+    });
+    assert_eq!(shader.root_uavs, [super::SLOT_TEXTURE_READS]);
+    assert!(build_with_view_root(WATERFALL_INDEXED_WAVE32, false, RootType::ResourceHeap).root_uavs.is_empty());
+    assert!(super::with_texture_feedback(|| build(WATERFALL_INDEXED_WAVE32, false)).root_uavs.is_empty());
+    let views = [
+        View::Texture(1, 1, &[[1.; 4]]), View::Texture(1, 1, &[[2.; 4]]),
+        View::RawUav(32), View::RawUavData(&[0, 0]),
+    ];
+    let sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, MaxAnisotropy: 1, MaxLOD: f32::MAX, ..Default::default()
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (warp, label) in [(false, "hardware"), (true, "WARP")] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("texture feedback pipeline");
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize])), (1, Root::Uav(1))],
+            views: &views, samplers: &[sampler], groups: [1, 1, 1],
+        }).expect("texture feedback dispatch");
+        assert_eq!(out[1], [3, 0], "{label} marked slots 0 and 1");
+        for (lane, &red) in out[0].iter().enumerate() {
+            assert_eq!(f32::from_bits(red), [1., 2.][lane % 2], "{label} lane {lane}");
+        }
+        eprintln!("validated sampled texture indices and colors on {label}");
     }
 }
 

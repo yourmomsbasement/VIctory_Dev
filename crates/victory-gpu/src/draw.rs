@@ -1111,6 +1111,24 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_TEXTURE_READS {
+                    if self.heaps[0] == 0 {
+                        return false;
+                    }
+                    let heap = crate::descriptor::heap(self.heaps[0] as This);
+                    let Some(host) = heap.host() else { return false };
+                    let Some(gpu) = list.texture_reads.bind(&list.list, host) else { return false };
+                    Self::heap_textures(list, heap, host, crate::frame::current());
+                    // SAFETY: the shader declares a raw root UAV and the list owns its backing.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -1494,7 +1512,7 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
-        self.heap_textures(list, heap, host);
+        Self::heap_textures(list, heap, host, frame);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1520,20 +1538,15 @@ impl State {
     /// something reads them) and uploaded, as a table read would do, for
     /// shaders that pick them by a computed index. Within a budget of bytes
     /// per frame and in all; the rest waits for later lists and frames.
-    /// The most recently written slots first (`TextureQueue::due`); slots
-    /// draws read through tables are not in the queue.
-    /// shortcut: uploaded once, and again only when the title rewrites the
-    /// slot. A placed texture not all mapped yet is uploaded with what is
-    /// there and looked at again (1, 2, 4, ... frames later, at most about
-    /// a second): uploaded again when more of it is mapped. Pages mapped
-    /// in place of others, and contents changed with no descriptor write,
-    /// are missed (hook the page-mapping events for those).
+    /// GPU-reported texture reads get first choice among due slots. Mapping
+    /// changes make affected textures due again, and incomplete uploads keep
+    /// their retry state until the remaining pages arrive.
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
-    fn heap_textures(
-        &self,
+    pub(crate) fn heap_textures(
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
+        frame: u64,
     ) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
@@ -1543,7 +1556,9 @@ impl State {
         const PER_FRAME: u64 = 192 << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
-        let frame = crate::frame::current();
+        if host.texture_frame.fetch_max(frame + 1, Ordering::Relaxed) >= frame + 1 {
+            return;
+        }
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }

@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod feedback;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -1155,6 +1157,60 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_sampled_texture_uploads_when_its_pages_arrive_without_a_descriptor_write() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        let Some(device) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut h = null;
+        assert_eq!(create(HeapDesc { kind: 0, count: 4, flags: 1, nodes: 0 },
+            Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let heap = heap(h);
+        let mirror = heap.host().unwrap();
+        let shape = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0];
+        let size = crate::resource::placed_bytes(&shape).unwrap() as usize;
+        // SAFETY: reserve our own region, initially inaccessible to the upload pass.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        let address = memory as u64;
+        let mut desc = [0; 16];
+        // RGBA8 Texture2D, default component mapping, mip 0, one level.
+        desc[..6].copy_from_slice(&[28, 4, 5768, 0, 0, 1]);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        let handle = heap.handle(1).unwrap();
+        create_placed_srv(null, &shape, &desc, handle);
+        assert!(mirror.textures.lock().unwrap().sampled(1));
+        let list = device.new_list().unwrap();
+        crate::draw::State::heap_textures(&list, heap, mirror, 10);
+        assert!(mirror.bound_shape(1).is_none());
+        // SAFETY: commit and populate the same reserved region, keeping the descriptor intact.
+        unsafe {
+            assert_eq!(VirtualAlloc(memory, size, MEM_COMMIT, PAGE_READWRITE), memory);
+            std::ptr::write_bytes(memory.cast::<u8>(), 0x5a, size);
+        }
+        crate::draw::State::heap_textures(&list, heap, mirror, 11);
+        assert_eq!(mirror.bound_shape(1), Some((4, 4, 28)));
+        let image = crate::resource::texture_at(address, &shape).unwrap();
+        crate::list::ensure_state(&list, image, 0x800);
+        let tex = crate::resource::host_resource(image).unwrap();
+        let (readback, layout) = crate::capture::read_back(&device.device, &list.list, tex).unwrap();
+        list.close();
+        device.execute(&[&list]);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the GPU copy completed and the footprint contains four 16-byte rows.
+        unsafe {
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            for y in 0..4 {
+                let row = data.cast::<u8>().add(layout.Offset as usize + y * layout.Footprint.RowPitch as usize);
+                assert_eq!(std::slice::from_raw_parts(row, 16), &[0x5a; 16]);
+            }
+            readback.Unmap(0, None);
+            assert_ne!(VirtualFree(memory, 0, MEM_RELEASE), 0);
+        }
+        object::release(h);
     }
 
     /// Grand Theft Auto VI places its shader-visible heap in its own memory

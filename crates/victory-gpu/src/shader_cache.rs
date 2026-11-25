@@ -56,6 +56,7 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
+                bytes.push(u8::from(texture_feedback()));
                 // So are the switches that pick the form of a wave64 program:
                 // without them here a run with `VICTORY_WAVE_WIDE=0` was
                 // served the translations an earlier run of the same
@@ -88,10 +89,22 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+fn texture_feedback() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_HEAP_USAGE").is_none_or(|value| value != "0"))
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let shader = if texture_feedback() {
+            victory_shader::emit::translate_with_texture_feedback(c)
+        } else {
+            victory_shader::emit::translate(c)
+        };
+        shader.map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),

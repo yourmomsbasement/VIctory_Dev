@@ -48,6 +48,8 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// Root UAV containing the indices of sampled textures, one bit per heap slot.
+pub const SLOT_TEXTURE_READS: u8 = 252;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.

@@ -743,6 +743,7 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    pub(crate) texture_reads: crate::descriptor::feedback::TextureReads,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2666,6 +2667,7 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    list.texture_reads.completed();
     #[cfg(feature = "diagnostics")]
     list.mesh_queries.save();
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
@@ -2862,6 +2864,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                texture_reads: Default::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4438,6 +4441,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.texture_reads.resolve(&self.list);
         #[cfg(feature = "diagnostics")]
         self.mesh_queries.resolve(&self.list);
         #[cfg(feature = "diagnostics")]
@@ -4460,6 +4464,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.texture_reads.reset();
         #[cfg(feature = "diagnostics")]
         self.mesh_queries.reset();
         #[cfg(feature = "diagnostics")]
@@ -6002,7 +6007,7 @@ impl Meter {
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                     {} made slots found unmapped and made null",
+                     {} made slots found unmapped and made null, {} pending texture slots prioritized from GPU reads",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
@@ -6010,7 +6015,8 @@ impl Meter {
                     crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                    crate::descriptor::feedback::PROMOTED.load(Ordering::Relaxed)
                 );
             }
             #[cfg(feature = "diagnostics")]
