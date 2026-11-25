@@ -1369,9 +1369,84 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Whether the title's bytes put in under flights go to copies in the card's
+/// memory as whole dwords (`VICTORY_MERGE_DWORDS=1`; off by default).
+///
+/// The title writes its data at four bytes or more, so every byte of a dword
+/// it changed is its own; a byte-exact compare of rewritten floats splits
+/// them into runs of one to three bytes (their equal high bytes stay), and
+/// past [`merge_runs_cap`] runs a submission settled every flight in the air
+/// instead (48 ms a frame in a world scene). With the switch the runs are
+/// widened to the dwords they touch and joined where they meet; a dword the
+/// title left alone is never covered (a shader may have written it), and the
+/// cap is [`MERGE_RUNS_WIDE`].
+pub(crate) fn merge_dwords() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_DWORDS").is_some_and(|v| v == "1"))
+}
+
+/// The changed runs a submission may put into copies in the card's memory
+/// with [`merge_dwords`]: each is one copy command of its own, about a
+/// microsecond to record, against a settle of every flight.
+pub(crate) const MERGE_RUNS_WIDE: usize = 16384;
+
+/// The changed runs a submission may put into copies in the card's memory
+/// before it settles the flights instead.
+pub(crate) fn merge_runs_cap() -> usize {
+    if merge_dwords() { MERGE_RUNS_WIDE } else { 512 }
+}
+
+/// `runs` (offset, bytes; in order, as [`changed_runs`] gives them) of bytes
+/// at title address `base` widened to the whole dwords they touch, cut to
+/// `len` bytes, and joined where they touch or overlap.
+fn dword_runs(runs: &[(usize, usize)], base: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for &(at, n) in runs {
+        let lo = ((base + at) & !3).saturating_sub(base).min(at);
+        let hi = ((base + at + n).div_ceil(4) * 4 - base).min(len);
+        match out.last_mut() {
+            Some(last) if lo <= last.0 + last.1 => last.1 = last.1.max(hi - last.0),
+            _ => out.push((lo, hi - lo)),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, dword_runs};
+
+    /// Runs of bytes become whole dwords of the title's addresses, joined
+    /// where they meet, never covering a dword with no changed byte, and cut
+    /// to the slice.
+    #[test]
+    fn changed_runs_widen_to_whole_dwords() {
+        // A float at 4 whose last two bytes changed, one at 8 whose first
+        // byte changed: one run 4..12. A byte at 17 alone: 16..20.
+        assert_eq!(dword_runs(&[(6, 2), (8, 1), (17, 1)], 0x1000, 64), [(4, 8), (16, 4)]);
+        // Dwords of the title's addresses, not the slice's: the slice starts
+        // two bytes into a dword.
+        assert_eq!(dword_runs(&[(1, 1)], 0x1002, 64), [(0, 2)]);
+        assert_eq!(dword_runs(&[(3, 1)], 0x1002, 64), [(2, 4)]);
+        // Cut at the end of the slice.
+        assert_eq!(dword_runs(&[(9, 1)], 0x1000, 10), [(8, 2)]);
+        // A dword in between that nothing changed stays out.
+        assert_eq!(dword_runs(&[(0, 1), (8, 1)], 0x1000, 64), [(0, 4), (8, 4)]);
+        // Rewritten floats: a byte-exact compare gives a run per float or
+        // less, the dwords one run.
+        let was: Vec<u8> = (0..64u32).flat_map(|i| (i as f32 * 0.5).to_le_bytes()).collect();
+        let now: Vec<u8> = (0..64u32).flat_map(|i| (i as f32 * 0.5 + 0.001).to_le_bytes()).collect();
+        let runs = changed_runs(&now, &was);
+        assert!(runs.len() > 8, "byte runs: {}", runs.len());
+        let wide = dword_runs(&runs, 0x2000, now.len());
+        assert_eq!(wide, [(0, 256)]);
+        // Every byte that differs is in a widened run.
+        for (i, (a, b)) in now.iter().zip(&was).enumerate() {
+            if a != b {
+                assert!(wide.iter().any(|&(at, n)| at <= i && i < at + n));
+            }
+        }
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -2326,6 +2401,7 @@ impl Shadow {
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
+                    let runs = if merge_dwords() { dword_runs(&runs, lo, n) } else { runs };
                     if runs.len() > *runs_left {
                         return refused(3, lo, hi);
                     }
