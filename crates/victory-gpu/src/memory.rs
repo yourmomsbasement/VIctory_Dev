@@ -45,6 +45,7 @@
 //! dirty-page mask written by the shader would bound both.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
@@ -233,6 +234,27 @@ impl Memory {
     }
 }
 
+/// Numbered copies this command list has already scheduled for refresh or
+/// copy-back. Other recording lists may append to the shared directory.
+#[derive(Default)]
+pub(crate) struct Coverage {
+    reads: usize,
+    writes: usize,
+}
+
+impl Coverage {
+    pub(crate) fn advance(&mut self, count: usize, writes: bool) -> (Range<usize>, Range<usize>) {
+        let reads = self.reads..count;
+        self.reads = count;
+        let writes = if writes {
+            std::mem::replace(&mut self.writes, count)..count
+        } else {
+            count..count
+        };
+        (reads, writes)
+    }
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -257,7 +279,6 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
     }
@@ -290,24 +311,17 @@ pub(crate) fn ready(
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
-    const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
-    let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
+    let (reads, writes) = list.memory_coverage(m.copies.len(), writes);
+    for shadow in &m.copies[reads] {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
-        }
-        if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
-        }
+        shadow.refresh(list, start, len);
     }
-    if first_read {
+    for shadow in &m.copies[writes] {
+        let (start, len) = shadow.span();
+        shadow.gpu_writes(list, start, len);
+    }
+    const KEEP_DIRECTORY: usize = usize::MAX - 0x6d;
+    if list.first_use(KEEP_DIRECTORY) {
         list.keep(&m.directory.0);
         list.keep(&m.faults.0);
     }
@@ -316,4 +330,21 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Coverage;
+
+    #[test]
+    fn interleaved_lists_cover_new_copies_and_promote_reads_to_writes() {
+        let mut first = Coverage::default();
+        let mut second = Coverage::default();
+        assert_eq!(first.advance(2, true), (0..2, 0..2));
+        assert_eq!(second.advance(4, false), (0..4, 4..4));
+        assert_eq!(first.advance(4, false), (2..4, 4..4));
+        assert_eq!(first.advance(4, true), (4..4, 2..4));
+        assert_eq!(second.advance(5, true), (4..5, 0..5));
+        assert_eq!(second.advance(5, true), (5..5, 5..5));
+    }
 }
