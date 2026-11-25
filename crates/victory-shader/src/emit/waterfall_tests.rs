@@ -14,17 +14,25 @@ use crate::{io, ir, resource, structure};
 
 #[test]
 fn dword_loads_cross_character_records_in_raw_and_structured_views() {
+    for record_bytes in [100, 1580] {
+        check_cross_record_reads(record_bytes);
+    }
+}
+
+fn check_cross_record_reads(record_bytes: u32) {
+    let last = record_bytes - 4;
+    let second_last = 2 * record_bytes - 4;
     let words: &[u32] = &[
         0xbe84_0300, 0xbe85_0380, // input table at s[4:5]
         0xbe86_0301, 0xbe87_0380, // output table at s[6:7]
         0xf408_0502, 0xfa00_0000, // input descriptor in s[20:23]
         0xf408_0a03, 0xfa00_0000, // output descriptor in s[40:43]
         0xbf8c_c07f,
-        0xf428_060a, 0xfa00_0060, // four dwords starting at byte 96
+        0xf428_060a, 0xfa00_0000 | last, // four dwords spanning the first boundary
         0xbf8c_c07f,
         0x7e08_0218, 0x7e0a_0219, 0x7e0c_021a, 0x7e0e_021b,
         0xe078_0000, 0x800a_0400, // buffer_store_dwordx4 v[4:7]
-        0x7e04_02ff, 196,         // v2 = final dword of record 1
+        0x7e04_02ff, second_last, // v2 = final dword of record 1
         0xe034_1000, 0x8005_0802, // buffer_load_dwordx2 v[8:9], v2, s[20:23], 0 offen
         0xbf8c_3f70,
         0xe074_0010, 0x800a_0800, // buffer_store_dwordx2 v[8:9], offset:16
@@ -39,13 +47,14 @@ fn dword_loads_cross_character_records_in_raw_and_structured_views() {
     let native = NativeProgram {
         stage: HwStage::Cs, wave64: false, vgprs: 10,
         layout: vec![param(0), param(1)],
-        used: vec![used(0, ResourceType::Srv, 100), used(1, ResourceType::Uav, 0)],
+        used: vec![used(0, ResourceType::Srv, record_bytes), used(1, ResourceType::Uav, 0)],
         io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [1, 1, 1] }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let shader = host_shader(lower_native(&native));
     assert!(shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_TABLE_STRUCTURE)));
-    let data: Vec<u32> = (0..75).map(|i| 0x5555_0000 + i).collect();
+    let record_words = record_bytes / 4;
+    let data: Vec<u32> = (0..3 * record_words).map(|i| 0x5555_0000 + i).collect();
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -53,12 +62,11 @@ fn dword_loads_cross_character_records_in_raw_and_structured_views() {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        // Two leading records put the structured SRV at offset 200 (8 mod 16),
-        // as in the captured mesh draw. The first raw dword is at offset 0.
-        let padded = [vec![0xdead_beef; 50], data.clone()].concat();
+        // Both record sizes put the structured view 8 bytes past a 16-byte boundary.
+        let padded = [vec![0xdead_beef; 2 * record_words as usize], data.clone()].concat();
         for (stride, actual, input) in [
             (Stride::Raw, 0, &data),
-            (Stride::Structured { bytes: 100, first: 2 }, 100, &padded),
+            (Stride::Structured { bytes: record_bytes, first: 2 }, record_bytes, &padded),
         ] {
             let mut constants = vec![0; shader.user_data_dwords() as usize];
             for u in &shader.user_data {
@@ -73,8 +81,10 @@ fn dword_loads_cross_character_records_in_raw_and_structured_views() {
                 views: &[View::Buffer { data: input, stride }, View::RawUav(6)],
                 samplers: &[], groups: [1; 3],
             }).expect("dispatch");
-            assert_eq!(out[0][..4], data[24..28], "{label}, stride {actual}");
-            assert_eq!(out[0][4..], data[49..51], "{label}, stride {actual}");
+            let first = (last / 4) as usize;
+            let second = (second_last / 4) as usize;
+            assert_eq!(out[0][..4], data[first..first + 4], "{label}, stride {actual}");
+            assert_eq!(out[0][4..], data[second..second + 2], "{label}, stride {actual}");
         }
     }
 }

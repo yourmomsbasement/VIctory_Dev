@@ -6216,11 +6216,10 @@ impl<'a> Lower<'a> {
         addr: V,
         count: u32,
     ) -> Result<Vec<V>, Why> {
-        let load = |l: &mut Self, stride: Option<u32>| -> Result<Vec<V>, Why> {
-            let props = stride.map_or((11, 0), |s| (12, s));
+        let load = |l: &mut Self, stride: Option<V>| -> Result<Vec<V>, Why> {
+            let props = stride.map_or((11, 0), |_| (12, u.stride));
             let h = l.handle(site, src, false, props)?;
             let c = l.cur;
-            let stride = stride.map(|s| l.s.m.i32(s));
             let mut words = Vec::new();
             for k in 0..count {
                 let step = l.s.m.i32(4 * k);
@@ -6249,7 +6248,11 @@ impl<'a> Lower<'a> {
         let (elements, bytes, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(self.cur, Term::CondBr(structured, elements, bytes));
         self.cur = elements;
-        let a = load(self, Some(u.stride))?;
+        // NVIDIA rejects some material pipelines when both the divisor and
+        // the structured-view annotation are literal 1580. In this branch
+        // the checked host stride has exactly that value.
+        let divisor = if u.stride == 1580 { actual } else { stride };
+        let a = load(self, Some(divisor))?;
         let from_elements = self.cur;
         self.s.m.terminate(from_elements, Term::Br(join));
         self.cur = bytes;
