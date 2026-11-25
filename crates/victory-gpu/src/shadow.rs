@@ -1665,6 +1665,23 @@ impl Shadow {
         self.id
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_header(&self, id: u64, slot: u32, address: u64) {
+        let Some(offset) = self.offset_in(address).filter(|_| self.left(address) >= 4) else { return };
+        let mut bytes = [0; 4];
+        let staged = crate::host::read_into(self.data.wrapping_add(offset as usize), &mut bytes)
+            .then(|| u32::from_le_bytes(bytes));
+        let at = address as usize;
+        let page = at / PAGE - self.start as usize / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get(page).copied();
+        let busy = self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter()
+            .any(|&(a, b)| a < at + 4 && b > at);
+        let physical = crate::inplace::physical_views(at);
+        tracing::info!(id, slot, address, shadow = self.id, base = self.start, size = self.len,
+            card = self.carded(), placed = self.place.is_some(), ?staged, ?copied, busy, ?physical,
+            "submitted indexed buffer storage");
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)

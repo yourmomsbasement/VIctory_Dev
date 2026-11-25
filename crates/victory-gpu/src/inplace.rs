@@ -343,6 +343,17 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
 }
 
+/// Number of registered virtual views of the same physical byte.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn physical_views(at: usize) -> Option<(usize, u64, usize)> {
+    let v = views();
+    let Cover::Run(section, offset) = cover_in(&v.views, at, 1) else { return None };
+    let aliases = v.views.values().filter(|&&(bytes, s, first)| {
+        s == section && offset.checked_sub(first).is_some_and(|n| n < bytes as u64)
+    }).count();
+    Some((section, offset, aliases))
+}
+
 /// Whether `[at, at + len)` is private memory, all committed and
 /// read-write: what [`From::Part`] takes. One question to Windows (it
 /// walks the page tables to the end of the pages that share the first

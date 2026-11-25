@@ -26,6 +26,8 @@ use crate::pipeline::host::HostPipeline;
 
 #[cfg(feature = "diagnostics")]
 mod material_inputs;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod buffer_window;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -997,6 +999,8 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             self.trace_buffer_views(stage, &made, compute);
+            #[cfg(feature = "diagnostics")]
+            self.trace_buffer_window(list, stage, &made, compute);
             #[cfg(feature = "diagnostics")]
             self.trace_texture_record(stage, compute);
             // What the shader stores through root views and raw addresses is

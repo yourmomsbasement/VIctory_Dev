@@ -170,6 +170,31 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Guest and mirrored placed-buffer descriptions at submission, while the
+/// heap registry keeps its storage alive. The title may have recycled its slot.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn inspect_placed_slot(
+    heap_key: usize, base: u64, index: u32,
+) -> Option<(Option<View>, Option<View>)> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let &(_, _, at) = heaps.iter().find(|&&(start, _, h)| start == base && h == heap_key)?;
+    // SAFETY: Heap::drop removes this entry under the same lock.
+    let heap = unsafe { &*(at as *const Heap) };
+    let address = heap.handle(index)?;
+    let mut record = [0; 12];
+    let placed = |v: &View| matches!(v, View::Placed(false, r, _) if r[0] == 1);
+    let guest = if crate::host::read_into(address as *const u8, &mut record) {
+        let words = std::array::from_fn(|i| u32::from_le_bytes(record[4 * i..4 * i + 4].try_into().unwrap()));
+        recorded_view(words).filter(placed)
+    } else {
+        None
+    };
+    let bound = heap.host.get()?.as_ref()?.bound_buffer_view(index)
+        .map(|(view, _)| view)
+        .filter(placed);
+    Some((guest, bound))
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
@@ -740,7 +765,10 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    recorded_view(unsafe { (handle as *const [u32; 3]).read_unaligned() })
+}
+
+fn recorded_view([tag, i, generation]: [u32; 3]) -> Option<View> {
     if tag != VIEW_TAG {
         return None;
     }

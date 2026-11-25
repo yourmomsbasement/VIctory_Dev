@@ -746,6 +746,8 @@ pub(crate) struct HostList {
     pub(crate) texture_reads: crate::descriptor::feedback::TextureReads,
     #[cfg(feature = "diagnostics")]
     pub(crate) pixel_samples: crate::pixel_samples::Samples,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) buffer_windows: crate::draw::buffer_window::Windows,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2673,6 +2675,8 @@ fn read_backs(list: &HostList) {
     #[cfg(feature = "diagnostics")]
     list.pixel_samples.save();
     #[cfg(feature = "diagnostics")]
+    list.buffer_windows.save();
+    #[cfg(feature = "diagnostics")]
     list.mesh_queries.save();
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
@@ -2871,6 +2875,8 @@ impl Host {
                 texture_reads: Default::default(),
                 #[cfg(feature = "diagnostics")]
                 pixel_samples: Default::default(),
+                #[cfg(feature = "diagnostics")]
+                buffer_windows: Default::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4475,6 +4481,8 @@ impl HostList {
         self.texture_reads.reset();
         #[cfg(feature = "diagnostics")]
         self.pixel_samples.reset();
+        #[cfg(feature = "diagnostics")]
+        self.buffer_windows.reset();
         #[cfg(feature = "diagnostics")]
         self.mesh_queries.reset();
         #[cfg(feature = "diagnostics")]
