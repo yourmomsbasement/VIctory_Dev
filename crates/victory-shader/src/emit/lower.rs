@@ -1872,7 +1872,8 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
-            Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::Active(op, src, mask, ident) => (op, Some(src), mask, ident, None),
+            Shape::DoubleCountHigh(mask) => (Op::AddU, None, mask, 0, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -1887,7 +1888,7 @@ impl<'a> Lower<'a> {
                 return Ok(self.s.m.select(c, on, x, id));
             }
             Shape::Prefix(op, src, mask, ident, inclusive) => {
-                (op, src, mask, ident, Some(inclusive))
+                (op, Some(src), mask, ident, Some(inclusive))
             }
         };
         // Mesh: no host wave size can be declared, so a reduction is over this host wave
@@ -1912,7 +1913,10 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
-        let x = self.i32_of(src)?;
+        let x = match src {
+            Some(src) => self.i32_of(src)?,
+            None => self.s.m.i32(1),
+        };
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
@@ -2035,6 +2039,18 @@ impl<'a> Lower<'a> {
         } else {
             r
         };
+        if matches!(shape, Shape::DoubleCountHigh(_)) {
+            // A count of 0..64 fits both formats exactly. Move the exponent
+            // and fraction into the high double word and adjust the bias.
+            let c = self.cur;
+            let single = self.s.m.cast(c, Cast::UiToFp, r, self.s.t.f32);
+            let bits = self.as_int(single);
+            let (three, bias, zero) = (self.s.m.i32(3), self.s.m.i32((1023 - 127) << 20), self.s.m.i32(0));
+            let bits = self.s.m.bin(c, Bin::LShr, bits, three);
+            let high = self.s.m.bin(c, Bin::Add, bits, bias);
+            let empty = self.s.m.cmp(c, pred::EQ, r, zero);
+            return Ok(self.s.m.select(c, empty, zero, high));
+        }
         Ok(if float { self.as_int(r) } else { r })
     }
 

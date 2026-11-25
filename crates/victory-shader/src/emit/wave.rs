@@ -104,6 +104,8 @@ pub(crate) enum Sym {
     Own(Value),
     /// A uniform value from before the section.
     Uni(Value),
+    /// High dword of the exact double-precision count of selected lanes.
+    DoubleCount { mask: Value, lanes: u64 },
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
     Red {
         op: Option<Op>,
@@ -119,6 +121,7 @@ pub(crate) enum Sym {
 pub(crate) enum Shape {
     K(u32),
     Value(Value),
+    DoubleCountHigh(Value),
     /// The lane's own `mask ? src : ident`.
     Masked(Value, Value, u32),
     /// `op` over every lane.
@@ -169,7 +172,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
+        let shapes = simulate(&insts[i + 1..end], wave, saved, &insts[..i]);
         out.insert(i, Section { end, shapes });
         i = end + 1;
     }
@@ -257,7 +260,49 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// A literal moved into a vector register since the last EXEC change is known
+/// in each lane selected by the section's incoming mask.
+fn section_literals(before: &[Inst]) -> HashMap<Value, u32> {
+    let mut literals = HashMap::new();
+    for inst in before.iter().rev().take_while(|i| {
+        i.write(Reg::S(EXEC)).is_none() && i.write(Reg::S(EXEC + 1)).is_none()
+    }) {
+        let Fields::Valu(v) = &inst.fields else { continue };
+        if inst.name() != "v_mov_b32" || v.dpp.is_some() || v.sdwa.is_some()
+            || v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0
+        {
+            continue;
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else { continue };
+        let literal = match v.src.first() {
+            Some(&Operand::Literal(x)) => Some(x),
+            Some(&Operand::Const(c)) => crate::resource::inline(c),
+            _ => None,
+        };
+        if let Some((value, literal)) = inst.write(Reg::V(reg)).zip(literal) {
+            literals.insert(value, literal);
+        }
+    }
+    literals
+}
+
+/// The input to an exact double count is +0 or +1, or an earlier sum
+/// of such inputs. All partial sums through 64 have a zero low dword.
+fn count_term(lo: Sym, hi: Sym, literals: &HashMap<Value, u32>) -> Option<(Value, u64)> {
+    match lo {
+        Sym::K(0) => {}
+        Sym::Red { op: None, src, ident: 0, .. } if literals.get(&src) == Some(&0) => {}
+        _ => return None,
+    }
+    match hi {
+        Sym::DoubleCount { mask, lanes } => Some((mask, lanes)),
+        Sym::Red { op: None, src, mask, ident: 0, lanes }
+            if literals.get(&src) == Some(&0x3ff0_0000) => Some((mask, lanes)),
+        _ => None,
+    }
+}
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value, before: &[Inst]) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -268,6 +313,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let mut uni: HashMap<Value, Sym> = HashMap::new();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
+    let literals = if insts.iter().any(|i| i.name() == "v_add_f64") {
+        section_literals(before)
+    } else {
+        HashMap::new()
+    };
     for inst in insts {
         let name = inst.name();
         if inst.write(Reg::S(EXEC)).is_some() {
@@ -299,6 +349,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
+            if name == "s_mov_b32" && let [Operand::Scalar { code, .. }] = src.as_slice()
+                && let Some(value) = inst.read(Reg::S(*code)).and_then(|v| uni.get(&v)).copied()
+                && let Some(&(Reg::S(_), dst)) = inst.writes.first()
+            {
+                uni.insert(dst, value);
+            }
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
@@ -339,6 +395,37 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
         };
         let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
+        if name == "v_add_f64" && let Some(Operand::Vector { reg, .. }) = v.dst {
+            let Some(lo) = inst.write(Reg::V(reg)) else { continue };
+            let Some(hi) = reg.checked_add(1).and_then(|r| inst.write(Reg::V(r))) else { continue };
+            let words = |o: &Operand| {
+                let high = match *o {
+                    Operand::Vector { reg, dwords: 2 } => Operand::Vector { reg: reg.checked_add(1)?, dwords: 1 },
+                    Operand::Scalar { code, dwords: 2 } => Operand::Scalar { code: code.checked_add(1)?, dwords: 1 },
+                    _ => return None,
+                };
+                Some((lanes(o, &vec, &uni), lanes(&high, &vec, &uni)))
+            };
+            let operands = v.src.first().and_then(words).zip(v.src.get(1).and_then(words));
+            let mut lows = vec![Sym::Unknown; wave as usize];
+            let mut highs = lows.clone();
+            if !modifiers && v.dpp.is_none() && exec == all
+                && let Some(((al, ah), (bl, bh))) = operands
+            {
+                let count = |lo, hi| count_term(lo, hi, &literals);
+                for l in 0..wave as usize {
+                    if let Some(((mask, a), (other, b))) = count(al[l], ah[l]).zip(count(bl[l], bh[l]))
+                        && mask == other && a & b == 0
+                    {
+                        lows[l] = Sym::K(0);
+                        highs[l] = Sym::DoubleCount { mask, lanes: a | b };
+                    }
+                }
+            }
+            vec.insert(lo, lows);
+            vec.insert(hi, highs);
+            continue;
+        }
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
@@ -551,6 +638,7 @@ fn shapes(
     };
     let mut out = HashMap::new();
     let single = |s: Sym| match s {
+        Sym::DoubleCount { mask, lanes } if lanes == all => Some(Shape::DoubleCountHigh(mask)),
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -594,6 +682,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     }
     if lanes.iter().all(|&s| s == first) {
         return match first {
+            Sym::DoubleCount { mask, lanes } if lanes == all => Some(Shape::DoubleCountHigh(mask)),
             Sym::K(k) => Some(Shape::K(k)),
             Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
             Sym::Red {
@@ -756,6 +845,43 @@ mod tests {
             fi: false,
         };
         assert_eq!(dpp_lane(swap, 8), Some((9, false, true)));
+    }
+
+    #[test]
+    fn double_lane_count_requires_zero_or_one_and_distinct_lanes() {
+        let shape = |low: u32, high: u32, repeat: bool| {
+            // Set v6:v7 to the selected double, then put +0 in unselected lanes.
+            let mut words = vec![vop1(6, 1, 255), low, vop1(7, 1, 255), high, sop1(4, 0x25, 193)];
+            words.extend(vop3(2, 0x101, 128, 262, 4));
+            words.extend(vop3(3, 0x101, 128, 263, 4));
+            // XOR neighbours within each row. Omitting a bit and repeating
+            // a previous one counts lanes twice while skipping others.
+            for bit in [1, if repeat { 1 } else { 2 }, 4, 8] {
+                for r in 2..=3 {
+                    words.extend([vop1(r + 2, 1, 0xfa), dpp16(r, 0x160 + bit, 15, 15, true)]);
+                }
+                words.extend(vop3(2, 0x164, 260, 258, 0));
+            }
+            for r in 2..=3 {
+                words.extend(vop3(r + 2, 0x378, 256 + u16::from(r), 128, 128));
+            }
+            words.extend(vop3(2, 0x164, 260, 258, 0));
+            words.extend(vop3(8, 0x360, 258, 160, 0));
+            words.extend(vop3(9, 0x360, 259, 160, 0));
+            words.extend(vop3(2, 0x164, 8, 258, 0));
+            words.extend(vop3(9, 0x360, 259, 128, 0));
+            words.extend([sop1(10, 3, 9), sop1(EXEC, 4, 4)]);
+            let p = build(&words, true);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[2].write(Reg::S(4)).unwrap();
+            let high = insts[insts.len() - 3].write(Reg::S(10)).unwrap();
+            (sections(&p, 0)[&2].shapes.get(&high).copied(), Shape::DoubleCountHigh(saved))
+        };
+        let (actual, expected) = shape(0, 0x3ff0_0000, false);
+        assert_eq!(actual, Some(expected));
+        assert_eq!(shape(1, 0x3ff0_0000, false).0, None);
+        assert_eq!(shape(0, 0x4000_0000, false).0, None);
+        assert_eq!(shape(0, 0x3ff0_0000, true).0, None);
     }
 
     #[test]
