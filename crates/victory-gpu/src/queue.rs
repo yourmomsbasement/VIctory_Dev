@@ -585,13 +585,16 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One plane of a `PresentX` call (0x48-byte stride): frame token,
+/// resource count, and pointer to the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -816,24 +819,39 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        // SAFETY: the title passes `planes` plane descriptions.
+        let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        let mut resources = Vec::with_capacity(slice.len());
+        for plane in slice {
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before);
+                resources.push((resource, texture, state));
+            }
+        }
+        if !resources.is_empty() {
+            let sources: Vec<(&_, u32)> = resources
+                .iter()
+                .map(|(_, tex, state)| (*tex, *state))
+                .collect();
+            let shown = host.present(&sources, frame);
+            for &(resource, _, state) in &resources {
+                crate::resource::host_transition(resource, state);
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resources[0].0, resources[0].2, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
@@ -1067,8 +1085,8 @@ mod tests {
     fn newer_queues_have_their_methods_two_slots_later() {
         let (old, new) = (queue_table(false), queue_table(true));
         assert_eq!(old[10], new[10]); // submission stays at 0x50
-        assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
-        assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
+        assert_eq!(old[14], new[16]); // signal 0x70 â†’ 0x80
+        assert_eq!(old[30], new[32]); // present 0xf0 â†’ 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
     }
 
