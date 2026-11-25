@@ -707,6 +707,11 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        if kind == victory_shader::emit::USER_TABLE_STRUCTURE {
+            return self.table_view(compute, slot, dword)
+                .and_then(|v| crate::descriptor::host::host_structured_stride(&v))
+                .unwrap_or(0);
+        }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
             // (`root_uav`, `root_srv_table`).
@@ -945,6 +950,8 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
+            #[cfg(feature = "diagnostics")]
+            self.trace_buffer_views(stage, &made, compute);
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
@@ -2133,6 +2140,64 @@ impl State {
         let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
         if frame.len() < 256 {
             frame.push(line);
+        }
+    }
+
+    /// For a selected shader, compare the host slot actually bound to the
+    /// copy refreshed for each buffer. Fresh tables can use different slots
+    /// from those the title recorded.
+    #[cfg(feature = "diagnostics")]
+    fn trace_buffer_views(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        made: &[(u8, u32)],
+        compute: bool,
+    ) {
+        static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let hashes = HASHES.get_or_init(|| {
+            std::env::var("VICTORY_TRACE_BUFFER_VIEWS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|hash| !hash.is_empty())
+                .map(str::to_owned)
+                .collect()
+        });
+        if !hashes.contains(&stage.shader.hash) {
+            return;
+        }
+        let frame = crate::queue::presented() + 1;
+        if !crate::capture::listed(frame) {
+            return;
+        }
+        for u in stage.translated().used.iter().filter(|u| {
+            u.root == RootType::Table && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+        }) {
+            let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(heap) = self.heap_of(handle) else { continue };
+            let Some(host) = heap.host() else { continue };
+            let Some(view) = crate::descriptor::view(handle) else { continue };
+            let Some((shadow, address, size)) = crate::descriptor::host::buffer_copy(&view) else {
+                continue;
+            };
+            let index = match made.iter().find(|(slot, _)| *slot == u.slot) {
+                Some((_, start)) => (start / 32) + u.table_offset_dwords / 8,
+                None => {
+                    let Some(index) = heap.index(handle) else { continue };
+                    index
+                }
+            };
+            let binding = match host.shows(index, &shadow.buffer) {
+                Some(true) => "matched",
+                Some(false) => "other",
+                None => "null",
+            };
+            tracing::info!(frame, shader = %stage.shader.hash, slot = u.slot, dword = u.table_offset_dwords,
+                index, binding, address, size, offset = shadow.offset(address), stride = u.stride,
+                "shader buffer binding");
         }
     }
 

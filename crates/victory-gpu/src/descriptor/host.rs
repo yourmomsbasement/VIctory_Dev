@@ -1566,6 +1566,28 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
         .flatten()
 }
 
+/// The stride of an SRV that stays structured in `buffer_srv`. Its bytes
+/// can start on a whole element of the host buffer without starting on 16.
+pub(crate) fn host_structured_stride(view: &View) -> Option<u32> {
+    let words = match view {
+        View::Shader(_, Some(d)) if d[1] == 1 => d,
+        View::Placed(false, resource, d) if resource[0] == 1 => d[..10].try_into().ok()?,
+        _ => return None,
+    };
+    let desc = srv_desc(words);
+    // SAFETY: a buffer SRV's union member.
+    let b = unsafe { desc.Anonymous.Buffer };
+    let stride = b.StructureByteStride;
+    if desc.Format != DXGI_FORMAT_UNKNOWN || stride == 0 || !stride.is_multiple_of(4) {
+        return None;
+    }
+    let (base, bytes) = buffer_extent(view)?;
+    let shadow = crate::shadow::find(base, bytes)?;
+    let offset = shadow.offset(base);
+    (offset.is_multiple_of(u64::from(stride))
+        && raw_window(offset, b.FirstElement, b.NumElements, stride).is_none()).then_some(stride)
+}
+
 /// Whether the host accepts a buffer view with these fields of a buffer of
 /// `width` bytes. It removes the device for one it does not (view creation
 /// returns nothing), and the console is laxer: the title's heap holds

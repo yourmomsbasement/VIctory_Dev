@@ -1126,7 +1126,7 @@ fn translated_compute_matches_pc() {
         },
         View::Buffer {
             data: &structured_data,
-            stride: Stride::Structured(16),
+            stride: Stride::Structured { bytes: 16, first: 0 },
         },
         View::Buffer {
             data: &raw_data,

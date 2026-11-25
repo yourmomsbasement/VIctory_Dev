@@ -5555,23 +5555,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
+        if let Some(u) = kind.filter(|u| u.kind == ResourceType::Srv) {
+            let words = self.table_srv_words(site, src, u, addr, count)?;
+            for (k, x) in words.into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6093,6 +6079,77 @@ impl<'a> Lower<'a> {
             }
             _ => Ok((0, None)),
         }
+    }
+
+    /// An element of this fixed view can start between two raw-view boundaries.
+    fn may_stay_structured(&self, src: &Source, u: &UsedResource) -> bool {
+        let Source::Loaded { load, first } = src else { return false };
+        u.root == RootType::Table
+            && u.kind == ResourceType::Srv
+            && u.stride.is_multiple_of(4)
+            && !u.stride.is_multiple_of(16)
+            && self.scalar.get(load).is_some_and(|a| {
+                a.dynamic.is_none() && a.offset / 4 + u32::from(*first) == u.table_offset_dwords
+            })
+    }
+
+    /// Read dwords at console byte offsets. A fixed table entry sometimes
+    /// stays structured: e.g. the 100-byte character records can begin
+    /// eight bytes past the alignment a raw host view requires.
+    fn table_srv_words(
+        &mut self,
+        site: Site,
+        src: &Source,
+        u: &UsedResource,
+        addr: V,
+        count: u32,
+    ) -> Result<Vec<V>, Why> {
+        let load = |l: &mut Self, stride: Option<u32>| -> Result<Vec<V>, Why> {
+            let props = stride.map_or((11, 0), |s| (12, s));
+            let h = l.handle(site, src, false, props)?;
+            let c = l.cur;
+            let stride = stride.map(|s| l.s.m.i32(s));
+            let mut words = Vec::new();
+            for k in 0..count {
+                let step = l.s.m.i32(4 * k);
+                let a = l.s.m.bin(c, Bin::Add, addr, step);
+                let mask = l.s.m.i8(1);
+                let (element, offset) = match stride {
+                    Some(s) => (l.s.m.bin(c, Bin::UDiv, a, s), l.s.m.bin(c, Bin::URem, a, s)),
+                    None => (a, l.s.m.undef(l.s.t.i32)),
+                };
+                let align = l.s.m.i32(4);
+                let r = l.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, l.s.t.res_ret, 139,
+                    &[h, element, offset, mask, align]);
+                let x = l.s.m.extract(c, r, 0);
+                words.push(l.as_int(x));
+            }
+            Ok(words)
+        };
+        if !self.may_stay_structured(src, u) {
+            return load(self, None);
+        }
+        let actual = self.host_word(
+            RootType::Other(super::shader::USER_TABLE_STRUCTURE), u.slot, u.table_offset_dwords,
+        );
+        let stride = self.s.m.i32(u.stride);
+        let structured = self.s.m.cmp(self.cur, pred::EQ, actual, stride);
+        let (elements, bytes, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(self.cur, Term::CondBr(structured, elements, bytes));
+        self.cur = elements;
+        let a = load(self, Some(u.stride))?;
+        let from_elements = self.cur;
+        self.s.m.terminate(from_elements, Term::Br(join));
+        self.cur = bytes;
+        let b = load(self, None)?;
+        let from_bytes = self.cur;
+        self.s.m.terminate(from_bytes, Term::Br(join));
+        self.cur = join;
+        Ok(a.into_iter().zip(b).map(|(a, b)| {
+            let p = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(p, vec![(a, from_elements), (b, from_bytes)]);
+            p
+        }).collect())
     }
 
     /// For a root view the host binds as a raw view that may begin before
@@ -10133,6 +10190,17 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        if !uav && !typed && narrow.is_none() && index.is_none()
+            && let Some(entry) = used.filter(|entry| self.may_stay_structured(src, entry))
+        {
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            for (k, word) in self.table_srv_words(site, src, entry, off, count)?.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), word, guard);
+            }
+            return Ok(());
+        }
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some((bits, signed)) = narrow {

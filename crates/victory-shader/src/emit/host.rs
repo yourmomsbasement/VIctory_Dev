@@ -1009,8 +1009,8 @@ pub enum Stride {
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes.
-    Structured(u32),
+    /// Structured elements, starting at the given record in the buffer.
+    Structured { bytes: u32, first: u32 },
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
 }
@@ -1326,6 +1326,10 @@ impl Host {
                     }
                     View::Buffer { data, stride } => {
                         let b = upload(data)?;
+                        let first = match stride {
+                            Stride::Structured { first, .. } => first,
+                            _ => 0,
+                        };
                         let (format, elements, stride, flags) = match stride {
                             Stride::Raw => (
                                 DXGI_FORMAT_R32_TYPELESS,
@@ -1339,7 +1343,7 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
-                            Stride::Structured(s) => (
+                            Stride::Structured { bytes: s, .. } => (
                                 DXGI_FORMAT_UNKNOWN,
                                 data.len() * 4 / s as usize,
                                 s,
@@ -1358,8 +1362,8 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 Buffer: D3D12_BUFFER_SRV {
-                                    FirstElement: 0,
-                                    NumElements: elements as u32,
+                                    FirstElement: u64::from(first),
+                                    NumElements: (elements as u32).checked_sub(first).ok_or("SRV starts past buffer")?,
                                     StructureByteStride: stride,
                                     Flags: flags,
                                 },
