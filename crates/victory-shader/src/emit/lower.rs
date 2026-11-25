@@ -29,6 +29,9 @@ pub(super) mod intersect;
 #[path = "pixel_samples.rs"]
 mod pixel_samples;
 
+#[path = "shadow_filter.rs"]
+mod shadow_filter;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -54,8 +57,7 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is used for comparisons.
-    pub cmp_samplers: u64,
+    pub static_samplers: Vec<super::StaticSampler>,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
@@ -91,9 +93,15 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_d16_pcf(parts, &[])
+}
+
+pub(crate) fn lower_d16_pcf(parts: &Parts, sites: &[usize]) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut lower = Lower::new(parts, &bad);
+        lower.d16_pcf_sites = sites;
+        match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -183,6 +191,7 @@ fn half_shift(width: u32) -> u32 {
 
 struct Lower<'a> {
     s: Shader,
+    d16_pcf_sites: &'a [usize],
     #[cfg(feature = "diagnostics")]
     material_tag: Option<[u8; 3]>,
     x: &'a Parts<'a>,
@@ -1581,6 +1590,7 @@ impl<'a> Lower<'a> {
         }
         Lower {
             s,
+            d16_pcf_sites: &[],
             #[cfg(feature = "diagnostics")]
             material_tag: if x.outputs.iter().any(|e| e.kind == 16 && e.row == Some(3)) {
                 super::material_tag(x.native)
@@ -2280,15 +2290,19 @@ impl<'a> Lower<'a> {
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
-        self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
+        let static_samplers = self.samplers.iter().zip(&self.s.sampler_comparisons)
+            .map(|(&words, &compare)| {
+                let mut sampler = super::StaticSampler::from_words(words);
+                if compare { sampler.filter = (sampler.filter & !0x180) | 0x80; }
+                sampler
+            }).collect();
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
-            cmp_samplers,
+            static_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
@@ -6364,18 +6378,19 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                // A console descriptor may be sampled both ways. DXIL's
+                // handle type and the root signature's filter must agree
+                // for the lifetime of each static sampler register.
+                let compare = props.0 & 0x8000 != 0;
+                let n = match self.samplers.iter().zip(&self.s.sampler_comparisons)
+                    .position(|(w, c)| *w == words && *c == compare) {
                     Some(n) => n,
                     None => {
                         self.samplers.push(words);
+                        self.s.sampler_comparisons.push(compare);
                         self.samplers.len() - 1
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -9749,6 +9764,7 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
+        let mut explicit_cmp = None;
         #[cfg(feature = "diagnostics")]
         let mut sample_uv = None;
         #[cfg(feature = "diagnostics")]
@@ -10062,6 +10078,12 @@ impl<'a> Lower<'a> {
                 64 | 65 => {
                     let reference = addr_u32(self, first - 1)?;
                     let reference = self.as_float(reference);
+                    if kind == 2 && name == "image_sample_c_lz"
+                        && self.d16_pcf_sites.contains(&inst.machine.offset)
+                        && shadow_filter::linear_clamp_less_equal(ss)
+                    {
+                        explicit_cmp = Some(self.d16_compare(h, cs[0], cs[1], reference));
+                    }
                     #[cfg(feature = "diagnostics")]
                     if kind == 2 && name == "image_sample_c_lz"
                         && let Some(probe) = super::compute_probe_at(inst.machine.offset)
@@ -10076,8 +10098,11 @@ impl<'a> Lower<'a> {
                     } else {
                         "sampleCmpLevelZero.f32"
                     };
-                    self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    if explicit_cmp.is_some() {
+                        self.s.m.undef(self.s.t.res_ret)
+                    } else {
+                        self.s.op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    }
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
@@ -10184,10 +10209,10 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = match gathered {
+            let x = explicit_cmp.unwrap_or_else(|| match gathered {
                 Some(g) => g[ch as usize],
                 None => self.s.m.extract(c, r, ch),
-            };
+            });
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
@@ -10217,7 +10242,7 @@ impl<'a> Lower<'a> {
         }
         #[cfg(feature = "diagnostics")]
         if let Some((probe, [u, v, reference], op)) = compute_sample {
-            let result = self.s.m.extract(self.cur, r, 0);
+            let result = explicit_cmp.unwrap_or_else(|| self.s.m.extract(self.cur, r, 0));
             self.trace_compute(inst, probe, [u, v, reference, result], guard, Some((h, op)))?;
         }
         #[cfg(feature = "diagnostics")]

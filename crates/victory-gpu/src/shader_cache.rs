@@ -69,6 +69,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_MATERIAL_IDS",
                     "VICTORY_TRACE_PIXEL_SAMPLES",
                     "VICTORY_TRACE_COMPUTE_VALUES",
+                    "VICTORY_D16_PCF",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

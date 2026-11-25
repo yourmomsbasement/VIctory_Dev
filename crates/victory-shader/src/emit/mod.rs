@@ -573,6 +573,18 @@ fn wide_wave64(c: &Container) -> bool {
     })
 }
 
+/// Mip-zero D16 comparison sites, configured as digest:pc,pc;digest:pc.
+fn d16_pcf_sites(c: &Container) -> Option<Vec<usize>> {
+    let setting = std::env::var("VICTORY_D16_PCF").ok()?;
+    setting.split(';').find_map(|entry| {
+        let (digest, sites) = entry.trim().split_once(':')?;
+        if digest.len() != 32 || u128::from_str_radix(digest, 16) != Ok(u128::from_be_bytes(c.digest)) {
+            return None;
+        }
+        sites.split(',').map(|pc| usize::from_str_radix(pc.trim(), 16).ok()).collect()
+    })
+}
+
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
@@ -704,7 +716,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -714,24 +726,17 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    let l = match d16_pcf_sites(c) {
+        Some(sites) => lower::lower_d16_pcf(&parts, &sites),
+        None => lower::lower(&parts),
+    }?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
-        static_samplers: l
-            .samplers
-            .iter()
-            .enumerate()
-            .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
-                }
-                s
-            })
-            .collect(),
+        static_samplers: l.static_samplers,
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,

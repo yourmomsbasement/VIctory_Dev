@@ -148,6 +148,19 @@ impl Shader {
                     }
                 }
                 if let Ok(t) = &done {
+                    #[cfg(all(windows, feature = "diagnostics"))]
+                    if crate::pixel_samples::compute_probes(&self.hash).is_some()
+                        && let Some(dir) = crate::capture::folder()
+                    {
+                        let _ = std::fs::write(dir.join(format!("{}-compute-probe.dxil", self.hash)), &t.host.dxil);
+                        for (register, (words, sampler)) in t.host.samplers.iter()
+                            .zip(&t.host.static_samplers).enumerate()
+                        {
+                            tracing::info!(shader = %self.hash, register, ?words,
+                                filter = sampler.filter, comparison = sampler.comparison,
+                                "compute probe static sampler");
+                        }
+                    }
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }

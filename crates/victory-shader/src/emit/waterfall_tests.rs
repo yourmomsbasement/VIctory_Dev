@@ -196,11 +196,15 @@ fn table_program(words: &[u32], buffers: bool, view_root: RootType) -> NativePro
 }
 
 fn lower_native(native: &NativeProgram) -> lower::Lowered {
+    lower_native_pcf(native, &[])
+}
+
+fn lower_native_pcf(native: &NativeProgram, sites: &[usize]) -> lower::Lowered {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
-    lower::lower(&lower::Parts {
+    lower::lower_d16_pcf(&lower::Parts {
         native,
         p: &p,
         st: &st,
@@ -210,7 +214,7 @@ fn lower_native(native: &NativeProgram) -> lower::Lowered {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
+    }, sites)
     .expect("lower")
 }
 
@@ -219,7 +223,7 @@ fn host_shader(lowered: lower::Lowered) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
-        static_samplers: lowered.samplers.iter().copied().map(super::StaticSampler::from_words).collect(),
+        static_samplers: lowered.static_samplers,
         samplers: lowered.samplers,
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
@@ -274,6 +278,81 @@ fn named_mip_gathers_preserve_tap_order_offsets_and_sampler_edges() {
             assert_eq!(taps, expected, "{label} mode={mode:?} offset={offset:?} uv={uv} lod={lod}");
         }
         eprintln!("validated named-mip gather taps on {label}");
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn ordinary_and_comparison_samples_use_distinct_static_samplers() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let words = [
+        0xbe84_0300, 0xbe85_0380, 0xf40c_0302, 0xfa00_0000, // texture
+        0xbe88_03ff, 0x3092, 0xbe89_03ff, 0x00c0_0000,
+        0xbe8a_03ff, 0x1850_0000, 0xbe8b_0380, // immediate linear clamp, less-equal
+        0x7e04_02ff, 0.6f32.to_bits(), 0x7e06_02f0, 0x7e08_02f0,
+        0xf09c_0108, 0x0043_0803, // sample_lz
+        0xf0bc_0108, 0x0043_0802, // sample_c_lz, same descriptor words
+        0xbf81_0000,
+    ];
+    let native = table_program(&words, false, RootType::Table);
+    let probes = [60, 68].map(|pc| super::ComputeProbe { pc, coord_regs: [0, 3],
+        span: [0, 0, 0.5f32.to_bits()] });
+    let shader = super::with_compute_probes(&probes, || host_shader(lower_native(&native)));
+    assert_eq!(shader.static_samplers.iter().map(|s| s.filter).collect::<Vec<_>>(), [0x15, 0x95]);
+    let texels = [0.25, 0.5, 0.75, 1.0];
+    let mut header = [0; 2 + 2 * super::PIXEL_SAMPLE_WORDS as usize];
+    header[1] = 1;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let output = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize])), (1, Root::Uav(0))],
+            views: &[View::Depth32(2, 2, &texels), View::RawUavData(&header)],
+            samplers: &[], groups: [1; 3],
+        }).unwrap();
+        assert_eq!(output[0][0], 2);
+        let mut samples: Vec<_> = output[0][2..].chunks_exact(super::PIXEL_SAMPLE_WORDS as usize)
+            .map(|r| (r[0], f32::from_bits(r[7]))).collect();
+        samples.sort_by_key(|r| r.0);
+        assert_eq!(samples, [(60, 0.625), (68, 0.5)]);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn explicit_d16_shadow_compares_codes_before_filtering() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let reference = (33137.25f32 / 65535.0).to_bits();
+    for (uv, codes, expected) in [
+        (0.5f32, [33136u16; 4], 0.0f32),
+        (0.5, [33137; 4], 1.0),
+        (0.5, [33137, 33136, 33142, 33136], 0.5),
+        (0.0, [33136, 33137, 33137, 33137], 0.0),
+        (1.0, [33136, 33136, 33136, 33137], 1.0),
+    ] {
+        let words = [
+            0xbe84_0300, 0xbe85_0380, 0xf40c_0302, 0xfa00_0000,
+            0xbe88_03ff, 0x3092, 0xbe89_03ff, 0x00c0_0000, 0xbe8a_03ff, 0x1850_0000, 0xbe8b_0380,
+            0x7e04_02ff, reference, 0x7e06_02ff, uv.to_bits(), 0x7e08_02ff, uv.to_bits(),
+            0xf0bc_0108, 0x0043_0802, 0xbf81_0000,
+        ];
+        let native = table_program(&words, false, RootType::Table);
+        let probe = super::ComputeProbe { pc: 68, coord_regs: [0, 3], span: [0, 0, uv.to_bits()] };
+        let shader = super::with_compute_probes(&[probe], || host_shader(lower_native_pcf(&native, &[68])));
+        let texels = codes.map(|n| f32::from(n) / 65535.0);
+        let mut header = [0; 2 + super::PIXEL_SAMPLE_WORDS as usize];
+        header[1] = 1;
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let output = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize])), (1, Root::Uav(0))],
+                views: &[View::Depth32(2,2,&texels), View::RawUavData(&header)],
+                samplers: &[], groups: [1;3],
+            }).unwrap();
+            assert_eq!(output[0][0], 1);
+            assert_eq!(f32::from_bits(output[0][9]), expected, "uv={uv}, codes={codes:?}, warp={warp}");
+        }
     }
 }
 
