@@ -1222,6 +1222,62 @@ mod tests {
         object::release(h);
     }
 
+    /// Streaming can populate an already mapped mip without rewriting the SRV.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn sampled_sparse_mips_pick_up_writes_to_already_mapped_pages() {
+        use windows_sys::Win32::System::Memory::*;
+        let Some(device) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut h = null;
+        assert_eq!(create(HeapDesc { kind: 0, count: 4, flags: 1, nodes: 0 },
+            Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let heap = heap(h);
+        let mirror = heap.host().unwrap();
+        let shape = [3, 0, 0, 0, 1024, 0, 1024, 9 << 16 | 1, 99, 1, 0, 0x10a, 0, 0];
+        let size = crate::resource::placed_bytes(&shape).unwrap() as usize;
+        let prefix = 96 * 4096;
+        assert!(size > prefix);
+        // SAFETY: the reservation belongs to the test. Only its mip prefix is committed.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!memory.is_null());
+        assert_eq!(unsafe { VirtualAlloc(memory, prefix, MEM_COMMIT, PAGE_READWRITE) }, memory);
+        let address = memory as u64;
+        let mut srv = [0; 16];
+        srv[..6].copy_from_slice(&[99, 4, 5768, 0, 1, 8]);
+        (srv[10], srv[11]) = (address as u32, (address >> 32) as u32);
+        create_placed_srv(null, &shape, &srv, heap.handle(1).unwrap());
+        let first = device.new_list().unwrap();
+        crate::draw::State::heap_textures(&first, heap, mirror, 100);
+        first.close();
+        device.execute(&[&first]);
+        assert_eq!(mirror.bound_shape(1), Some((1024, 1024, 99)));
+        mirror.textures.lock().unwrap().sampled(1);
+        // SAFETY: the first submission finished, and the prefix is committed.
+        unsafe { std::ptr::write_bytes(memory.cast::<u8>(), 0x5a, prefix) };
+        let second = device.new_list().unwrap();
+        crate::draw::State::heap_textures(&second, heap, mirror, 500);
+        let image = crate::resource::texture_at(address, &shape).unwrap();
+        crate::list::ensure_state(&second, image, 0x800);
+        let tex = crate::resource::host_resource(image).unwrap();
+        let (readback, footprint) = crate::capture::read_back_of(&device.device, &second.list, tex, 1).unwrap();
+        second.close();
+        device.execute(&[&second]);
+        // SAFETY: the fence covers all 128 block rows of mip 1.
+        unsafe {
+            let mut data = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            for y in 0..128 {
+                let offset = footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize;
+                let row = std::slice::from_raw_parts(data.cast::<u8>().add(offset), 128 * 16);
+                assert!(row.iter().all(|&b| b == 0x5a), "mip 1, block row {y}");
+            }
+            readback.Unmap(0, None);
+            VirtualFree(memory, 0, MEM_RELEASE);
+        }
+        object::release(h);
+    }
+
     /// Grand Theft Auto VI places its shader-visible heap in its own memory
     /// and checks that the heap starts there.
     #[test]

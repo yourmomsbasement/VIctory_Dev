@@ -299,6 +299,10 @@ struct Waiting {
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
+    /// First retry frame after the last partial upload. A subsequent GPU
+    /// read can request a bounded recheck even if the mapping stays the same.
+    partial_due: u64,
+    read_since_upload: bool,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -321,7 +325,8 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { sampled: false, due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { sampled: false, due, written: frame, write, looks: 0,
+            mapped: 0, partial_due: 0, read_since_upload: false });
     }
 
     fn remove(&mut self, index: u32) {
@@ -331,7 +336,10 @@ impl TextureQueue {
     /// A sampled slot moves ahead of speculative uploads if it is pending.
     /// Its current descriptor generation and retry state remain authoritative.
     pub(crate) fn sampled(&mut self, index: u32) -> bool {
-        self.slots.get_mut(&index).is_some_and(|w| !std::mem::replace(&mut w.sampled, true))
+        self.slots.get_mut(&index).is_some_and(|w| {
+            w.read_since_upload |= w.mapped != 0;
+            !std::mem::replace(&mut w.sampled, true)
+        })
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -403,6 +411,8 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            w.partial_due = due;
+            w.read_since_upload = false;
         }
     }
 
@@ -415,13 +425,22 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         let sampled = self.slots.get(&index).is_some_and(|w| w.sampled);
-        self.slots.insert(index, Waiting { sampled, due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { sampled, due, written: frame, write, looks: 0,
+            mapped: 0, partial_due: 0, read_since_upload: false });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
     /// (0: not uploaded, or all of it was).
+    #[cfg(test)]
     fn mapped(&self, index: u32) -> u64 {
         self.slots.get(&index).map_or(0, |w| w.mapped)
+    }
+
+    fn needs_partial_upload(&self, index: u32, write: u64, mapped: u64, frame: u64, interval: u64) -> bool {
+        self.slots.get(&index).is_some_and(|w| {
+            let sampled_again = w.read_since_upload && frame.saturating_sub(w.partial_due) >= interval;
+            w.write == write && (mapped > w.mapped || sampled_again)
+        })
     }
 
     /// For the frame line: slots in the queue; of them due at `frame`;
@@ -871,10 +890,12 @@ impl HostHeap {
         textures.later(index, write, frame, most);
     }
 
-    /// Bytes of title slot `index`'s memory that were mapped when it was
-    /// last uploaded in part (0: not uploaded, or whole).
-    pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
+    /// Mapped bytes may still be filled after the first upload. A shader
+    /// that sampled that partial texture gets another look at its contents
+    /// after the queue's normal retry interval. New pages are served at once.
+    pub(crate) fn needs_partial_upload(&self, index: u32, write: u64, mapped: u64, frame: u64, interval: u64) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner())
+            .needs_partial_upload(index, write, mapped, frame, interval)
     }
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
@@ -2481,6 +2502,11 @@ mod tests {
         assert_ne!(q.due(2, 1)[0].0, slot);
         assert_eq!(q.due(3, 1), [(slot, write)]);
         assert_eq!(q.mapped(slot), 256);
+        assert!(!q.needs_partial_upload(slot, write, 256, 3, 16));
+        assert!(q.needs_partial_upload(slot, write, 512, 3, 16));
+        assert!(q.needs_partial_upload(slot, write, 256, 18, 16));
+        q.partly(slot, write, 19, 256);
+        assert!(!q.needs_partial_upload(slot, write, 256, 40, 16));
         q.changed(slot, 3, 4);
         q.done(slot, write);
         let (same_slot, next_write) = q.due(4, 1)[0];
