@@ -3101,6 +3101,22 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            if self.mask_data == MaskData::Console && !self.x.native.wave64 {
+                if high {
+                    return Ok(self.s.m.i32(0));
+                }
+                if let Some(&(word, _)) = self.ballots.get(&lo) {
+                    return Ok(word);
+                }
+                if !self.balloting.insert(lo) {
+                    return Err(MASK_ELSEWHERE);
+                }
+                let result = self.scalar_mask_word(lo);
+                self.balloting.remove(&lo);
+                let word = result?;
+                self.ballots.insert(lo, (word, self.s.m.i32(0)));
+                return Ok(word);
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -3150,6 +3166,62 @@ impl<'a> Lower<'a> {
     }
 
     // ---- operands ----
+
+    /// A scalar mask instruction in a wave32 compute program writes a full
+    /// dword, including bits of lanes outside EXEC. A ballot at that point
+    /// would lose those bits. Rebuild the scalar operation at its definition.
+    fn scalar_mask_word(&mut self, value: Value) -> Result<V, Why> {
+        let block = *self.def_block.get(&value).ok_or(MASK_ELSEWHERE)?;
+        let inst = self.x.p.blocks[block].insts.iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == value)).ok_or(MASK_ELSEWHERE)?;
+        let Fields::Sop { dst: Some(Operand::Scalar { code, .. }), src, .. } = &inst.fields
+            else { return Err(MASK_ELSEWHERE) };
+        if inst.write(Reg::S(*code)) != Some(value) || inst.write(Reg::S(EXEC)).is_some() {
+            return Err(MASK_ELSEWHERE);
+        }
+        let at = if block == self.cur_ir { self.cur } else { self.tail[block].ok_or(MASK_ELSEWHERE)? };
+        let arg = |lower: &mut Self, n: usize| lower.operand(inst, src.get(n).ok_or(MASK_ELSEWHERE)?);
+        let left = arg(self, 0)?;
+        let ones = self.s.m.i32(u32::MAX);
+        match inst.name() {
+            "s_mov_b32" => Ok(left),
+            "s_not_b32" => Ok(self.s.m.bin(at, Bin::Xor, left, ones)),
+            "s_cselect_b32" => {
+                let right = arg(self, 1)?;
+                let cond = match self.get(inst.read(Reg::Scc).ok_or(MASK_ELSEWHERE)?)? {
+                    Val::Bit(bit) => bit,
+                    Val::I32(word) => {
+                        let zero = self.s.m.i32(0);
+                        self.s.m.cmp(at, pred::NE, word, zero)
+                    }
+                    Val::Missing(why) => return Err(why),
+                };
+                Ok(self.s.m.select(at, cond, left, right))
+            }
+            name => {
+                let right = arg(self, 1)?;
+                self.scalar_logic_word(at, name, left, right).ok_or(MASK_ELSEWHERE)
+            }
+        }
+    }
+
+    fn scalar_logic_word(&mut self, at: usize, name: &str, left: V, right: V) -> Option<V> {
+        let (op, invert_right, invert_result) = match name {
+            "s_and_b32" => (Bin::And, false, false),
+            "s_or_b32" => (Bin::Or, false, false),
+            "s_xor_b32" => (Bin::Xor, false, false),
+            "s_andn2_b32" => (Bin::And, true, false),
+            "s_orn2_b32" => (Bin::Or, true, false),
+            "s_nand_b32" => (Bin::And, false, true),
+            "s_nor_b32" => (Bin::Or, false, true),
+            "s_xnor_b32" => (Bin::Xor, false, true),
+            _ => return None,
+        };
+        let ones = self.s.m.i32(u32::MAX);
+        let right = if invert_right { self.s.m.bin(at, Bin::Xor, right, ones) } else { right };
+        let word = self.s.m.bin(at, op, left, right);
+        Some(if invert_result { self.s.m.bin(at, Bin::Xor, word, ones) } else { word })
+    }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
         match *op {
@@ -5298,21 +5370,8 @@ impl<'a> Lower<'a> {
             }
             "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
             | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" => {
-                let (a, mut b) = (src32(self, 0)?, src32(self, 1)?);
-                let ones = self.s.m.i32(u32::MAX);
-                if name.contains("n2") {
-                    b = self.s.m.bin(c, Bin::Xor, b, ones);
-                }
-                let op = match &name[2..5] {
-                    "and" | "nan" => Bin::And,
-                    "or_" | "orn" | "nor" => Bin::Or,
-                    _ => Bin::Xor,
-                };
-                let mut r = self.s.m.bin(c, op, a, b);
-                if matches!(name, "s_nand_b32" | "s_nor_b32" | "s_xnor_b32") {
-                    r = self.s.m.bin(c, Bin::Xor, r, ones);
-                }
-                (r, None)
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                (self.scalar_logic_word(c, name, a, b).ok_or("an unknown scalar logic opcode")?, None)
             }
             "s_lshl_b32" | "s_lshr_b32" | "s_ashr_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);

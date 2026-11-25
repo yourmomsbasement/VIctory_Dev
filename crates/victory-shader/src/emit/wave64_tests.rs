@@ -453,6 +453,25 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
     eprintln!("ran on the hardware device: the mask's bits, or the number");
 }
 
+#[test]
+fn a_scalar_mask_complement_keeps_bits_outside_the_active_wave32_lanes() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+        0xBE8D_3C6A, // s_and_saveexec_b32 s13, vcc_lo
+        0xBE94_077E, // s_not_b32 s20, exec_lo
+        0x7E00_0214, // v_mov_b32 v0, s20
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let shader = lowered(&native, &p, &HashSet::new()).unwrap();
+    for (lanes, expected) in [(1, 0xffff_fffe), (8, 0xffff_ff00), (31, 0x8000_0000)] {
+        let Some(value) = on_the_card(&shader, [lanes, 0]) else { return };
+        assert_eq!(value, expected, "active lanes {lanes}");
+    }
+}
+
 /// A 32-lane console wave. `if (t < s0) { ... SCC = (s1 == 7) }` and a branch on SCC after
 /// the join: the skip brings the SCC of `s_and_saveexec` ("some lane is left") along
 /// (`rtdirectionalshadows:CS_RTShadowTrace32HQ_TiledFarOnly`, 0x360-0x39c). On the console
