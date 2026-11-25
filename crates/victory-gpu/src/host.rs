@@ -4544,10 +4544,8 @@ impl HostList {
     /// unordered access state; the caller moves the depth texture to the
     /// state its use needs, as for any texture. A twin still ahead when the
     /// list closes is copied then (`twins_to_depth`).
-    /// shortcut: every depth target bound for a draw counts as written
-    /// (also when the draw only tests), and every unordered access view a
-    /// shader names as written; views a shader picks from the heap by a
-    /// computed index are not seen here at all.
+    /// Every unordered access view a shader names counts as written. Views
+    /// a shader picks from the heap by a computed index are not seen here.
     pub(crate) fn twin_use(
         &self,
         resource: crate::object::This,

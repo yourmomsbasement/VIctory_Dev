@@ -159,8 +159,9 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
-    /// The host state the bound depth view needs ([`depth_state`]).
+    /// The host state the bound depth view needs.
     depth_state: u32,
+    depth_read_only: D3D12_DSV_FLAGS,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
@@ -556,7 +557,12 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            self.depth_read_only = read_only_view_planes(texture, record.depth_desc().as_ref());
+            self.depth_state = if self.depth_read_only == BOTH_PLANES {
+                DEPTH_READ
+            } else {
+                DEPTH_WRITE
+            };
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -852,7 +858,8 @@ impl State {
         }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
+            let writes = (p.read_only_planes | self.depth_read_only) != BOTH_PLANES;
+            list.twin_use(self.depth as This, false, writes);
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -2561,31 +2568,28 @@ fn view_kind(view: &View) -> Option<ResourceType> {
     }
 }
 
-/// The host state a depth view needs of its texture: the read state if the
-/// view writes no plane the format has (the title's read-only flags), else
-/// the write state.
-/// shortcut: whole textures have one state, so a view that writes one of
-/// two planes counts as writing.
-fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) -> u32 {
-    // D16_UNORM and D32_FLOAT: depth formats without a stencil plane.
-    const ONE_PLANE: [i32; 2] = [55, 40];
-    let Some(desc) = desc else {
-        return DEPTH_WRITE;
-    };
-    let format = if desc.Format.0 == 0 {
+const BOTH_PLANES: D3D12_DSV_FLAGS = D3D12_DSV_FLAGS(
+    D3D12_DSV_FLAG_READ_ONLY_DEPTH.0 | D3D12_DSV_FLAG_READ_ONLY_STENCIL.0,
+);
+
+/// Planes this view cannot modify, including any absent stencil plane.
+fn read_only_view_planes(
+    texture: &ID3D12Resource,
+    desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
+) -> D3D12_DSV_FLAGS {
+    let format = desc.map_or(0, |d| d.Format.0);
+    let format = if format == 0 {
         // SAFETY: a live texture; a view without a format has its own.
         unsafe { texture.GetDesc() }.Format.0
     } else {
-        desc.Format.0
+        format
     };
-    let mut needed = D3D12_DSV_FLAG_READ_ONLY_DEPTH.0;
-    if !ONE_PLANE.contains(&format) {
-        needed |= D3D12_DSV_FLAG_READ_ONLY_STENCIL.0;
-    }
-    if desc.Flags.0 & needed == needed {
-        DEPTH_READ
+    let flags = desc.map_or(D3D12_DSV_FLAG_NONE, |d| d.Flags) & BOTH_PLANES;
+    // Include the typeless resource formats used with an inferred view.
+    if matches!(format, 39 | 40 | 53 | 55) {
+        flags | D3D12_DSV_FLAG_READ_ONLY_STENCIL
     } else {
-        DEPTH_WRITE
+        flags
     }
 }
 

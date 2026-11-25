@@ -291,6 +291,8 @@ pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    /// Planes the pipeline cannot modify, even through a writable DSV.
+    pub(crate) read_only_planes: D3D12_DSV_FLAGS,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -308,6 +310,25 @@ pub(crate) struct HostPipeline {
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) state: String,
+}
+
+fn read_only_planes(depth: &D3D12_DEPTH_STENCIL_DESC) -> D3D12_DSV_FLAGS {
+    let mut flags = D3D12_DSV_FLAG_NONE;
+    if !depth.DepthEnable.as_bool() || depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO {
+        flags |= D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+    }
+    let keeps_stencil = |face: &D3D12_DEPTH_STENCILOP_DESC| {
+        face.StencilFailOp == D3D12_STENCIL_OP_KEEP
+            && face.StencilDepthFailOp == D3D12_STENCIL_OP_KEEP
+            && face.StencilPassOp == D3D12_STENCIL_OP_KEEP
+    };
+    if !depth.StencilEnable.as_bool()
+        || depth.StencilWriteMask == 0
+        || (keeps_stencil(&depth.FrontFace) && keeps_stencil(&depth.BackFace))
+    {
+        flags |= D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+    }
+    flags
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -532,6 +553,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                read_only_planes: D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL,
                 pso,
                 root,
                 stages: bound,
@@ -570,6 +592,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                read_only_planes: read_only_planes(&g.depth),
                 pso,
                 root,
                 stages: bound,
@@ -682,6 +705,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            read_only_planes: read_only_planes(&g.depth),
             pso,
             root,
             stages: bound,
@@ -849,6 +873,23 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn depth_and_stencil_masks_identify_the_read_only_planes() {
+        let mut d = GraphicsState::default().depth;
+        assert_eq!(read_only_planes(&d), D3D12_DSV_FLAG_READ_ONLY_STENCIL);
+        d.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        d.StencilEnable = true.into();
+        let both = D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+        assert_eq!(read_only_planes(&d), both); // all stencil ops keep
+        d.BackFace.StencilDepthFailOp = D3D12_STENCIL_OP_REPLACE;
+        assert_eq!(read_only_planes(&d), D3D12_DSV_FLAG_READ_ONLY_DEPTH);
+        d.StencilWriteMask = 0;
+        assert_eq!(read_only_planes(&d), both);
+        d.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        d.DepthEnable = false.into();
+        assert_eq!(read_only_planes(&d), both);
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
