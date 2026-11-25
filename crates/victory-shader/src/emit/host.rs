@@ -1849,6 +1849,9 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
+                    // The root signature reserves one dword even when the
+                    // shader uses no user data. Initialize that slot explicitly.
+                    Root::Constants(data) if data.is_empty() => list.SetComputeRoot32BitConstant(*param, 0, 0),
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
                         *param,
                         data.len() as u32,
