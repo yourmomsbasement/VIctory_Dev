@@ -4541,6 +4541,12 @@ impl HostList {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn tracked_texture_state(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) -> Option<D3D12_RESOURCE_STATES> {
+        self.states.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&(std::sync::Arc::as_ptr(copy) as usize)).map(|entry| D3D12_RESOURCE_STATES(entry.1 as i32))
+    }
+
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's

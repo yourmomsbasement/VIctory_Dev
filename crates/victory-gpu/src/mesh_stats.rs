@@ -9,6 +9,8 @@
 //! as well as its dispatches on listed frames. Some lighting jobs run only at load.
 //! VICTORY_COMPUTE_MASK=slot+dword@x also reads one R8_UNORM texel at x
 //! on the configured material row before and after those dispatches.
+//! VICTORY_DEPTH_HISTORY=1280x720@352,364,310 records the two D32 depths
+//! at (352,310) and (364,310) around draws and depth clears on listed frames.
 
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
@@ -16,6 +18,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 
+mod depth;
 mod input;
 mod row;
 pub(crate) use input::Arguments;
@@ -67,7 +70,7 @@ impl Page {
 }
 
 #[derive(Default)]
-pub(crate) struct Queries(OnceLock<Mutex<Vec<Page>>>);
+pub(crate) struct Queries(OnceLock<Mutex<Vec<Page>>>, depth::History);
 
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -99,6 +102,13 @@ pub(crate) struct Active {
     occlusion: ID3D12QueryHeap,
     slot: u32,
     row: Option<row::Probe>,
+    depth_probe: Option<depth::Probe>,
+}
+
+pub(crate) fn begin_clear(list: &HostList, resource: usize, description: impl FnOnce() -> String) -> Option<depth::Probe> {
+    let frame = crate::queue::presented() + 1;
+    if !enabled() || !crate::capture::listed(frame) { return None; }
+    list.mesh_queries.1.begin(list, depth::source(resource)?, frame, resource, description(), 0)
 }
 
 pub(crate) enum Command<'a> {
@@ -146,7 +156,8 @@ pub(crate) fn begin(
             seen.insert(p.name.clone());
         }
     }
-    if matches!(command, Command::Raster(_)) && row_target.is_none() {
+    let depth_source = if listed && depth != 0 { depth::source(depth) } else { None };
+    if matches!(command, Command::Raster(_)) && row_target.is_none() && depth_source.is_none() {
         static SHADERS: OnceLock<Vec<String>> = OnceLock::new();
         let shaders = SHADERS.get_or_init(|| {
             std::env::var("VICTORY_RASTER_STATS")
@@ -194,6 +205,8 @@ pub(crate) fn begin(
             (args.map(|a| a.address), None, dispatch)
         }
     };
+    let depth_probe = depth_source.and_then(|src| list.mesh_queries.1.begin(
+        list, src, frame, depth, p.name.clone(), args.unwrap_or(0)));
     page.draws.push(Draw {
         frame,
         args,
@@ -217,6 +230,7 @@ pub(crate) fn begin(
         occlusion: page.occlusion.clone(),
         slot: index,
         row,
+        depth_probe,
     })
 }
 
@@ -233,6 +247,9 @@ impl Active {
             );
         }
         if let Some(probe) = self.row {
+            probe.copy(list, true);
+        }
+        if let Some(probe) = self.depth_probe {
             probe.copy(list, true);
         }
     }
@@ -267,6 +284,7 @@ impl Queries {
     }
 
     pub(crate) fn save(&self) {
+        self.1.save();
         let Some(pages) = self.0.get() else { return };
         let pages = pages.lock().unwrap_or_else(|e| e.into_inner());
         if pages.is_empty() {
@@ -336,6 +354,7 @@ impl Queries {
     }
 
     pub(crate) fn reset(&self) {
+        self.1.reset();
         if let Some(pages) = self.0.get() {
             pages.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }

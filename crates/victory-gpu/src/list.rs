@@ -1279,11 +1279,17 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        #[cfg(feature = "diagnostics")]
+        let probe = if flags & 1 != 0 {
+            crate::mesh_stats::begin_clear(list, record.resource as usize, || format!("clear depth {depth} rects {rects:?}"))
+        } else { None };
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(probe) = probe { probe.copy(list, true); }
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
