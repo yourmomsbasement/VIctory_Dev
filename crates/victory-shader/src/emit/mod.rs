@@ -239,6 +239,29 @@ thread_local! {
     static TEXTURE_FEEDBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Optional diagnostic capture of 2D samples on one horizontal span of pixels.
+/// The caller provides a root UAV with a count, enable word and sample records.
+#[cfg(feature = "diagnostics")]
+pub const SLOT_PIXEL_SAMPLES: u8 = 251;
+#[cfg(feature = "diagnostics")]
+pub const MAX_PIXEL_SAMPLES: u32 = 2048;
+#[cfg(feature = "diagnostics")]
+pub const PIXEL_SAMPLE_WORDS: u32 = 16;
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static SAMPLE_SPAN: std::cell::Cell<Option<[u32; 3]>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "diagnostics")]
+pub fn with_sample_span<T>(span: [u32; 3], f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<[u32; 3]>);
+    impl Drop for Restore {
+        fn drop(&mut self) { SAMPLE_SPAN.set(self.0); }
+    }
+    let _restore = Restore(SAMPLE_SPAN.replace(Some(span)));
+    f()
+}
+
 fn with_texture_feedback<T>(f: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
@@ -1601,6 +1624,48 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn tracing_a_pixel_texture_sample_keeps_its_export_and_validates() {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+        let words = [
+            0xbe84_0300_u32, 0xbe85_0380, 0xbe86_0301, 0xbe87_0380, // SRV and sampler tables
+            0xf408_0203, 0xfa00_0000, // sampler s[8:11]
+            0xf40c_0302, 0xfa00_0000, // texture s[12:19]
+            0x7e04_02f0, 0x7e06_02f0, // (0.5, 0.5)
+            0xf09c_0f08, 0x0043_0c02, // image_sample_lz v[12:15]
+            0xf800_180f, 0x0f0e_0d0c, 0xbf81_0000, // exp mrt0, end
+        ];
+        let table = |slot| RootParam { root: RootType::Table, table_offset_dwords: 0,
+            sgprs: 1, base_register: 0, user_data: slot, slot };
+        let view = |kind, slot, dwords| UsedResource { kind, root: RootType::Table,
+            table_offset_dwords: 0, lower_bound: 0, stride: 0, dwords, user_data: slot, slot };
+        let native = NativeProgram {
+            stage: HwStage::Ps, wave64: false, vgprs: 16, layout: vec![table(0), table(1)],
+            used: vec![view(ResourceType::Srv, 0, 8), view(ResourceType::Sampler, 1, 4)],
+            io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: 0, patches: vec![] },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let pos = SigElement { interp: 4, ..element("SV_Position", 3, 0) };
+        let target = SigElement { usage: 15, ..element("SV_Target", 16, 0) };
+        let input = container::signature(&[pos], true);
+        let output = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &input), (FourCC::OSG1, &output)]);
+        let c = Container::parse(&bytes).unwrap();
+        let program = ir::build(&native.code, false, 16).unwrap();
+        let st = structure::structure(&program).unwrap();
+        let io = io::raise(&program, &native).unwrap();
+        let resources = resource::track(&program, &native.layout, native.stage, Some(&st)).unwrap();
+        let compile = || emit(&c, &native, &program, &st, &io, &resources).unwrap();
+        let traced = with_sample_span([4, 8, 6], compile);
+        let original = compile();
+        assert_eq!(traced.root_uavs, [SLOT_PIXEL_SAMPLES]);
+        assert!(original.root_uavs.is_empty());
+        assert_eq!(Container::parse(&traced.dxil).unwrap().part(FourCC::OSG1).unwrap().data,
+                   Container::parse(&original.dxil).unwrap().part(FourCC::OSG1).unwrap().data);
+        validate(&traced);
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as

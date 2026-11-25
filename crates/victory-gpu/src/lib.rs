@@ -54,6 +54,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod mesh_stats;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod pixel_samples;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;

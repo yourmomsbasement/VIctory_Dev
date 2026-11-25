@@ -25,6 +25,10 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[cfg(feature = "diagnostics")]
+#[path = "pixel_samples.rs"]
+mod pixel_samples;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -9735,6 +9739,8 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
+        #[cfg(feature = "diagnostics")]
+        let mut sample_uv = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -9825,6 +9831,17 @@ impl<'a> Lower<'a> {
                     let n = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
                     *slot = self.s.m.bin(c, Bin::SDiv, *slot, n);
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if self.s.pixel && kind == 2 && (60..=65).contains(&op) && super::SAMPLE_SPAN.get().is_some() {
+                // Calculate implicit LOD before the pixel-selection branch, using
+                // the same quad derivatives and sampler as the original sample.
+                let lod = if op == 60 {
+                    let clamped = self.s.m.bool(true);
+                    self.s.op(c, "calculateLOD.f32", Attr::ReadOnly, self.s.t.f32, 81,
+                        &[h, sh, cs[0], cs[1], cs[2], clamped])
+                } else { self.s.m.f32(f32::NAN.to_bits()) };
+                sample_uv = Some([cs[0], cs[1], lod]);
             }
             if op == 81 {
                 // The clamped then the unclamped level of detail.
@@ -10173,6 +10190,12 @@ impl<'a> Lower<'a> {
         }
         for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(uv) = sample_uv {
+            let table = self.used_kind(src).filter(|u| u.root == RootType::Table)
+                .map(|u| [u32::from(u.slot), u.table_offset_dwords]);
+            self.trace_sample(inst.machine.offset, h, table, uv, r, guard)?;
         }
         Ok(())
     }

@@ -67,6 +67,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
                     "VICTORY_MATERIAL_IDS",
+                    "VICTORY_TRACE_PIXEL_SAMPLES",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -98,11 +99,20 @@ fn texture_feedback() -> bool {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| {
-        let shader = if texture_feedback() {
+        let run = || if texture_feedback() {
             victory_shader::emit::translate_with_texture_feedback(c)
         } else {
             victory_shader::emit::translate(c)
         };
+        #[cfg(feature = "diagnostics")]
+        let shader = match crate::pixel_samples::selected() {
+            Some((hash, span)) if blake3::hash(c).to_hex()[..16] == **hash => {
+                victory_shader::emit::with_sample_span(*span, run)
+            }
+            _ => run(),
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let shader = run();
         shader.map_err(|e| e.to_string())
     };
     match CACHE.get() {

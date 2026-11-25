@@ -744,6 +744,8 @@ pub(crate) struct HostList {
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     pub(crate) texture_reads: crate::descriptor::feedback::TextureReads,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) pixel_samples: crate::pixel_samples::Samples,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2669,6 +2671,8 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 fn read_backs(list: &HostList) {
     list.texture_reads.completed();
     #[cfg(feature = "diagnostics")]
+    list.pixel_samples.save();
+    #[cfg(feature = "diagnostics")]
     list.mesh_queries.save();
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
@@ -2865,6 +2869,8 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 texture_reads: Default::default(),
+                #[cfg(feature = "diagnostics")]
+                pixel_samples: Default::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4443,6 +4449,8 @@ impl HostList {
         self.twins_to_depth();
         self.texture_reads.resolve(&self.list);
         #[cfg(feature = "diagnostics")]
+        self.pixel_samples.resolve(&self.list);
+        #[cfg(feature = "diagnostics")]
         self.mesh_queries.resolve(&self.list);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -4465,6 +4473,8 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.texture_reads.reset();
+        #[cfg(feature = "diagnostics")]
+        self.pixel_samples.reset();
         #[cfg(feature = "diagnostics")]
         self.mesh_queries.reset();
         #[cfg(feature = "diagnostics")]

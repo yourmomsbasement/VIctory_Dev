@@ -396,6 +396,21 @@ struct Material {
 
 static MATERIALS: std::sync::Mutex<Vec<Material>> = std::sync::Mutex::new(Vec::new());
 
+/// Publish the complete snapshot before recording its name, including when
+/// several recording threads encounter the same material on the same frame.
+pub(crate) fn snapshot_material(folder: &std::path::Path, bytes: &[u8]) -> std::io::Result<String> {
+    let name = format!("material-buffer-{}.bin", blake3::hash(bytes).to_hex());
+    let path = folder.join(&name);
+    static FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writing = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    if !path.exists() {
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(tmp, path)?;
+    }
+    Ok(name)
+}
+
 /// Save the most detailed mip exposed by traced material SRVs in selected
 /// frames. The compressed blocks are copied unchanged from the GPU.
 pub(crate) fn material_frame(frame: u64) -> bool {
@@ -435,9 +450,12 @@ fn dump_materials(host: &crate::host::Host, frame: u64) {
             || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
         { continue }
         let format = if m.format == 0 { desc.Format.0 as u32 } else { m.format };
-        let block_bytes = match format {
-            71 | 72 | 80 | 81 => 8,                 // BC1, BC4
-            74 | 75 | 77 | 78 | 83 | 84 | 95 | 96 | 98 | 99 => 16,
+        let (element_bytes, element_width) = match format {
+            // Single-plane color views and BC blocks with a typed DXGI format.
+            2..=4 | 6..=8 | 10..=14 | 16..=18 | 24..=26 | 28..=32 | 34..=38
+            | 41..=43 | 49..=52 | 54 | 56..=59 | 61..=65 | 67 | 85..=88
+            | 91 | 93 | 115 | 71..=72 | 74..=75 | 77..=78 | 80..=81 | 83..=84
+            | 95..=96 | 98..=99 => crate::resource::element(format).unwrap(),
             _ => continue,
         };
         let old = m.copy.state.load(Relaxed);
@@ -450,16 +468,16 @@ fn dump_materials(host: &crate::host::Host, frame: u64) {
             let height = (desc.Height >> m.mip).max(1);
             let name = format!("material-{frame}-{}-word{}-slot{}-slice{}-mip{}.dds",
                 m.shader, m.word, m.slot, m.slice, m.mip);
-            reads.push((buffer, footprint, name, format, width, height, block_bytes));
+            reads.push((buffer, footprint, name, format, width, height, element_bytes, element_width));
         }
     }
     if reads.is_empty() { return }
     list.close();
     host.execute(&[&list]);
-    for (buffer, footprint, name, format, width, height, block_bytes) in reads {
+    for (buffer, footprint, name, format, width, height, element_bytes, element_width) in reads {
         let pitch = footprint.Footprint.RowPitch as usize;
-        let row = width.div_ceil(4) as usize * block_bytes;
-        let rows = height.div_ceil(4) as usize;
+        let row = width.div_ceil(element_width as u32) as usize * element_bytes as usize;
+        let rows = height.div_ceil(element_width as u32) as usize;
         // GetCopyableFootprints need not allocate padding after the last row.
         let bytes = pitch * (rows - 1) + row;
         let start = footprint.Offset as usize;
@@ -467,7 +485,8 @@ fn dump_materials(host: &crate::host::Host, frame: u64) {
         let mut dds = Vec::with_capacity(148 + rows * row);
         dds.extend_from_slice(b"DDS ");
         let mut header = [0u32; 36];
-        header[0..5].copy_from_slice(&[124, 0x81007, height, width, (row * rows) as u32]);
+        let (flags, size) = if element_width == 1 { (0x100F, row) } else { (0x81007, row * rows) };
+        header[0..5].copy_from_slice(&[124, flags, height, width, size as u32]);
         header[18..21].copy_from_slice(&[32, 4, u32::from_le_bytes(*b"DX10")]);
         header[26] = 0x1000;
         header[31..36].copy_from_slice(&[format, 3, 0, 1, 0]); // 2D, one array slice.

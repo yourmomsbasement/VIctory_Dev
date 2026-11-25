@@ -159,6 +159,9 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Final heap indices of texture handles for the optional pixel trace.
+    #[cfg(feature = "diagnostics")]
+    pub sample_indices: std::collections::HashMap<V, V>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -215,6 +218,8 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(feature = "diagnostics")]
+            sample_indices: Default::default(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -438,7 +443,12 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let handle = self.annotate(block, h, props.0, props.1);
+        #[cfg(feature = "diagnostics")]
+        if self.pixel && !sampler && (1..=9).contains(&props.0) && super::SAMPLE_SPAN.get().is_some() {
+            self.sample_indices.insert(handle, index);
+        }
+        handle
     }
 
     /// The finished container.

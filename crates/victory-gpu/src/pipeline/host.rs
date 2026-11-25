@@ -439,7 +439,10 @@ impl HostPipeline {
                     // table of strides, the directory of title memory by
                     // address and its fault notes.
                     let ours = if uav {
-                        matches!(slot, victory_shader::emit::SLOT_FAULTS | victory_shader::emit::SLOT_TEXTURE_READS)
+                        let ours = matches!(slot, victory_shader::emit::SLOT_FAULTS | victory_shader::emit::SLOT_TEXTURE_READS);
+                        #[cfg(feature = "diagnostics")]
+                        let ours = ours || slot == victory_shader::emit::SLOT_PIXEL_SAMPLES;
+                        ours
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY

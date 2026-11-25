@@ -69,6 +69,8 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     pub(crate) textures: Arc<Mutex<TextureQueue>>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) sampled_views: crate::pixel_samples::SampledViews,
     /// Last frame (plus one) in which either kind of bindless shader serviced the queue.
     pub(crate) texture_frame: std::sync::atomic::AtomicU64,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
@@ -685,6 +687,8 @@ impl HostHeap {
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Arc::default(),
+            #[cfg(feature = "diagnostics")]
+            sampled_views: Default::default(),
             texture_frame: Default::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))

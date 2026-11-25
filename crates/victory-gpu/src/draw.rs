@@ -24,6 +24,9 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+#[cfg(feature = "diagnostics")]
+mod material_inputs;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -149,6 +152,8 @@ fn windows() -> bool {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    #[cfg(feature = "diagnostics")]
+    pixel_sample: Option<u64>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -931,6 +936,8 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        { self.pixel_sample = None; }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -1111,6 +1118,16 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                #[cfg(feature = "diagnostics")]
+                if slot == victory_shader::emit::SLOT_PIXEL_SAMPLES {
+                    let frame = crate::queue::presented() + 1;
+                    let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+                    let Some((address, id)) = list.pixel_samples.bind(list, frame, heap) else { return false };
+                    self.pixel_sample = id;
+                    // SAFETY: the instrumented pixel stage declares this root UAV.
+                    unsafe { l.SetGraphicsRootUnorderedAccessView(param, address) };
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_TEXTURE_READS {
                     if self.heaps[0] == 0 {
                         return false;
@@ -1880,6 +1897,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
+            if material_inputs::selected(&stage.shader.hash) && crate::capture::listed(crate::queue::presented() + 1) {
+                self.describe_material_inputs(&mut text, &t.used, compute);
+            }
             for u in &t.host.user_data {
                 let v = match u.root {
                     RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
@@ -1900,8 +1920,12 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
+        if let Some(id) = self.pixel_sample {
+            let _ = write!(text, " pixel_probe={id}");
+        }
         text
     }
+
 
     /// Override the rasterizer rectangle for this mesh command only.
     fn override_mesh_scissor(&self, list: &HostList) -> bool {
@@ -2352,6 +2376,9 @@ impl State {
         let Some(address) = base.checked_add(u64::from(offset)) else { return };
         if !crate::host::read_into(address as *const u8, &mut data) {
             return;
+        }
+        if material_inputs::selected(&stage.shader.hash) {
+            tracing::info!(frame, shader = %record.shader, offset, bytes = ?data, "material record bytes");
         }
         let heap = crate::descriptor::heap(self.heaps[0] as This);
         let Some(host) = heap.host() else { return };
