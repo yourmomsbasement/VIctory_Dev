@@ -279,9 +279,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     true
 }
 
-/// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// Try a kernel read before waiting for the title's mapping lock
+/// (`VICTORY_TEXTURE_NO_WAIT=1`; off by default).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -293,22 +292,17 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
 /// ms, the texture's own lock 0).
 ///
-/// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
-///
-/// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. It never shows partly read.
+/// A successful whole-resource kernel read needs no lock. A streamed view
+/// may have every visible mip resident while larger mips have no pages.
+/// If the whole read fails, wait for a stable mapping and stage the resident
+/// data for this submission.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
-/// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there.
+/// Contended refreshes completed by a whole kernel read or retried under
+/// the mapping lock, respectively.
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
@@ -664,10 +658,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
+        let mapped = if no_wait() {
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
                 return self.refresh_unlocked(last, size);
             };
@@ -675,6 +666,10 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
+        self.refresh_mapped(last, size, mapped)
+    }
+
+    fn refresh_mapped(&self, last: &mut Last, size: usize, _mapped: crate::watch::Reading) -> usize {
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -741,12 +736,8 @@ impl Staging {
         size
     }
 
-    /// A refresh while the runtime is remapping title memory ([`no_wait`]):
-    /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
-    /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
+    /// The mapping lock was busy. A failed bulk read may have copied a prefix
+    /// into scratch. Only use it if the kernel completed the entire read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
@@ -765,8 +756,8 @@ impl Staging {
             size
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
-            last.asked = 0;
-            0
+            let mapped = waited(2, crate::watch::title_memory_reading);
+            self.refresh_mapped(last, size, mapped)
         }
     }
 
@@ -1069,6 +1060,55 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn a_contended_head_texture_upload_keeps_its_resident_mip() {
+        use windows::core::Interface;
+        use windows_sys::Win32::System::Memory::*;
+        if crate::host::host().is_none() {
+            return;
+        }
+        // BC1, nine mips in a 1024-square texture. The title maps the 43 pages
+        // containing the smaller mips while leaving the largest mip reserved.
+        let desc = [3, 0, 0, 0, 1024, 0, 1024, 9 << 16 | 1, 71, 1, 0, 0x105, 0, 0];
+        let size = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        let prefix = 43 * 4096;
+        assert!(prefix < size);
+        // SAFETY: the test owns the reservation and fills only the committed prefix.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!memory.is_null());
+        unsafe {
+            assert_eq!(VirtualAlloc(memory, prefix, MEM_COMMIT, PAGE_READWRITE), memory);
+            memory.cast::<u8>().write_bytes(0x5a, prefix);
+        }
+        let mut resource = std::ptr::null();
+        let status = crate::resource::create_at_address(
+            std::ptr::null(),
+            memory as u64,
+            &crate::resource::ResourceDesc::from_words(&desc),
+            0,
+            std::ptr::null(),
+            std::ptr::from_ref(&super::ID3D12Resource::IID).cast(),
+            &mut resource,
+        );
+        assert_eq!(status, crate::object::S_OK);
+        let texture = crate::resource::host_resource(resource).unwrap();
+        let staging = super::staging(resource, &texture).unwrap();
+        let mut last = staging.last.lock().unwrap();
+        // The path used at submission when a remap prevents the in-place read.
+        let refreshed = staging.refresh_unlocked(&mut last, size);
+        let mip = staging.footprints[1];
+        let pitch = mip.Footprint.RowPitch as usize;
+        // SAFETY: 128 rows of 128 BC1 blocks in the staging buffer's second footprint.
+        let pixels = unsafe { std::slice::from_raw_parts(staging.data.add(mip.Offset as usize), 127 * pitch + 1024) };
+        let correct = pixels.chunks(pitch).all(|row| row[..1024].iter().all(|&b| b == 0x5a));
+        drop(last);
+        drop(staging);
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(resource, 0x10)(resource);
+        // SAFETY: the test has finished reading the title allocation.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+        assert!(refreshed > 0 && correct, "the resident BC1 mip must reach the initial upload");
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
