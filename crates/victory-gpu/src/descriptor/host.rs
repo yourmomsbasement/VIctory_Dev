@@ -1382,6 +1382,22 @@ impl HostHeap {
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 
+    /// The recorded buffer SRV and the host resource currently bound at its slot.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bound_buffer_view(&self, index: u32) -> Option<(View, ID3D12Resource)> {
+        // Take the generation and the kept resource together, in mirror's lock order.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let key = *made.get(index as usize)?;
+        let view = view_at(key as u32, (key >> 32) as u32)?;
+        if !matches!(view, View::Shader(..) | View::Placed(false, ..)) {
+            return None;
+        }
+        buffer_range(&view)?;
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let resource = kept.get(index as usize)?.as_ref()?.clone();
+        Some((view, resource))
+    }
+
     /// Dimensions and format of the resource the shader-visible slot holds.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn bound_shape(&self, index: u32) -> Option<(u64, u32, i32)> {

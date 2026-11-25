@@ -1927,7 +1927,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     let overridden = self.override_mesh_scissor(list);
                     #[cfg(feature = "diagnostics")]
-                    let query = crate::mesh_stats::begin(list, self.pipeline, None, &self.targets, self.depth);
+                    let query = crate::mesh_stats::begin(list, self.pipeline, None, &self.targets, self.depth, self.heaps[0]);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     #[cfg(feature = "diagnostics")]
@@ -2649,6 +2649,8 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        #[cfg(feature = "diagnostics")]
+        let reused = hit.is_some();
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -2725,7 +2727,15 @@ impl State {
         let overridden = kind == MESH && self.override_mesh_scissor(list);
         #[cfg(feature = "diagnostics")]
         let query = if kind == MESH {
-            crate::mesh_stats::begin(list, self.pipeline, Some(arguments), &self.targets, self.depth)
+            let inputs = crate::mesh_stats::Arguments {
+                address: arguments,
+                source: (&args.buffer, offset),
+                submitted: (&bounded, at),
+                count: counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+                max,
+                reused,
+            };
+            crate::mesh_stats::begin(list, self.pipeline, Some(inputs), &self.targets, self.depth, self.heaps[0])
         } else {
             None
         };

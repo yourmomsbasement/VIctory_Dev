@@ -9,7 +9,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 
+mod input;
 mod row;
+pub(crate) use input::Arguments;
 
 const SLOTS: u32 = 64;
 type Statistics = D3D12_QUERY_DATA_PIPELINE_STATISTICS1;
@@ -22,6 +24,8 @@ struct Draw {
     depth: usize,
     pipeline: String,
     sampled_row: bool,
+    input: Option<input::Snapshot>,
+    dispatch: Option<input::Counts>,
 }
 
 struct Page {
@@ -92,9 +96,10 @@ pub(crate) struct Active {
 pub(crate) fn begin(
     list: &HostList,
     pipeline: usize,
-    args: Option<u64>,
+    args: Option<Arguments<'_>>,
     targets: &[usize],
     depth: usize,
+    heap: usize,
 ) -> Option<Active> {
     if !enabled() {
         return None;
@@ -123,13 +128,17 @@ pub(crate) fn begin(
     if let Some(probe) = &row {
         probe.copy(list, false);
     }
+    let input = input::capture(list, p, heap);
+    let dispatch = input.as_ref().and(args.as_ref()).and_then(|a| a.capture(list));
     page.draws.push(Draw {
         frame,
-        args,
+        args: args.map(|a| a.address),
         target: targets.first().copied().unwrap_or(0),
         depth,
         pipeline: p.name.clone(),
         sampled_row: row.is_some(),
+        input,
+        dispatch,
     });
     // SAFETY: fresh slots on a direct list, paired with end() on this list.
     unsafe {
@@ -215,7 +224,7 @@ impl Queries {
         if header {
             let _ = writeln!(
                 out,
-                "frame\targuments\ttarget0\tdepth\tpipeline\tmesh_invocations\tmesh_primitives\tclip_in\tclip_out\tpixel_invocations\tpassed_samples\tchanged_x"
+                "frame\targuments\ttarget0\tdepth\tpipeline\tmesh_invocations\tmesh_primitives\tclip_in\tclip_out\tpixel_invocations\tpassed_samples\tchanged_x\theap_input\tdispatch_source_submitted_count"
             );
         }
         for p in pages.iter() {
@@ -237,7 +246,7 @@ impl Queries {
                     };
                     let _ = writeln!(
                         out,
-                        "{}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         d.frame,
                         d.args.unwrap_or(0),
                         d.target,
@@ -249,7 +258,9 @@ impl Queries {
                         s.CPrimitives,
                         s.PSInvocations,
                         passed,
-                        changed
+                        changed,
+                        d.input.as_ref().map_or_else(|| "-".into(), input::Snapshot::words),
+                        d.dispatch.as_ref().map_or_else(|| "-".into(), input::Counts::words)
                     );
                 }
                 p.buffer.Unmap(0, None);
