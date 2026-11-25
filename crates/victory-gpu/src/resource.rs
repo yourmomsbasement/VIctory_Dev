@@ -2071,6 +2071,14 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
+/// Look up an existing host copy for diagnostics without creating one or
+/// extending the residency of an otherwise unused placed texture.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_copy(address: u64, desc: &[u32; 14]) -> Option<std::sync::Arc<HostTexture>> {
+    let object = *PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).get(&(address, *desc))?;
+    hosted(object as This, false).map(|(copy, _)| copy)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

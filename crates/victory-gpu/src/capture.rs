@@ -363,6 +363,9 @@ pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
+    if material_frame(frame) {
+        dump_materials(host, frame);
+    }
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
@@ -373,6 +376,113 @@ pub(crate) fn dump_targets(frame: u64) {
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+    }
+}
+
+struct Material {
+    frame: u64,
+    shader: String,
+    word: usize,
+    slot: u32,
+    mip: u32,
+    slice: u32,
+    format: u32,
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+}
+
+static MATERIALS: std::sync::Mutex<Vec<Material>> = std::sync::Mutex::new(Vec::new());
+
+/// Save the most detailed mip exposed by traced material SRVs in selected
+/// frames. The compressed blocks are copied unchanged from the GPU.
+pub(crate) fn material_frame(frame: u64) -> bool {
+    static FRAMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    FRAMES.get_or_init(|| std::env::var("VICTORY_DUMP_MATERIAL_FRAMES").unwrap_or_default()
+        .split(',').filter_map(|s| s.trim().parse().ok()).collect()).contains(&frame)
+}
+
+pub(crate) fn note_material(frame: u64, shader: &str, word: usize, slot: u32, srv: &[u32; 16],
+    copy: std::sync::Arc<crate::resource::HostTexture>)
+{
+    let mip = srv[4];
+    let slice = match srv[1] {
+        4 => 0,       // TEXTURE2D
+        5 => srv[6],  // first slice of TEXTURE2DARRAY
+        _ => return,
+    };
+    let format = crate::resource::pc_format(srv[0]);
+    let mut materials = MATERIALS.lock().unwrap_or_else(|e| e.into_inner());
+    if materials.len() < 128 && !materials.iter().any(|m| m.frame == frame && m.slot == slot
+        && m.shader == shader && m.word == word && m.mip == mip && m.slice == slice && m.format == format)
+    {
+        materials.push(Material { frame, shader: shader.into(), word, slot, mip, slice, format, copy });
+    }
+}
+
+fn dump_materials(host: &crate::host::Host, frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let materials = std::mem::take(&mut *MATERIALS.lock().unwrap_or_else(|e| e.into_inner()));
+    if materials.is_empty() { return }
+    let Ok(list) = host.new_list() else { return };
+    let mut reads = Vec::new();
+    for m in materials.into_iter().filter(|m| m.frame == frame) {
+        // SAFETY: the captured slot holds a reference to the texture.
+        let desc = unsafe { m.copy.texture.GetDesc() };
+        if m.mip >= u32::from(desc.MipLevels) || m.slice >= u32::from(desc.DepthOrArraySize)
+            || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
+        { continue }
+        let format = if m.format == 0 { desc.Format.0 as u32 } else { m.format };
+        let block_bytes = match format {
+            71 | 72 | 80 | 81 => 8,                 // BC1, BC4
+            74 | 75 | 77 | 78 | 83 | 84 | 95 | 96 | 98 | 99 => 16,
+            _ => continue,
+        };
+        let old = m.copy.state.load(Relaxed);
+        list.settle(&m.copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let sub = m.mip + m.slice * u32::from(desc.MipLevels);
+        let read = read_back_of(&host.device, &list.list, &m.copy.texture, sub);
+        list.settle(&m.copy, old);
+        if let Some((buffer, footprint)) = read {
+            let width = ((desc.Width as u32) >> m.mip).max(1);
+            let height = (desc.Height >> m.mip).max(1);
+            let name = format!("material-{frame}-{}-word{}-slot{}-slice{}-mip{}.dds",
+                m.shader, m.word, m.slot, m.slice, m.mip);
+            reads.push((buffer, footprint, name, format, width, height, block_bytes));
+        }
+    }
+    if reads.is_empty() { return }
+    list.close();
+    host.execute(&[&list]);
+    for (buffer, footprint, name, format, width, height, block_bytes) in reads {
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let row = width.div_ceil(4) as usize * block_bytes;
+        let rows = height.div_ceil(4) as usize;
+        // GetCopyableFootprints need not allocate padding after the last row.
+        let bytes = pitch * (rows - 1) + row;
+        let start = footprint.Offset as usize;
+        let mut data = std::ptr::null_mut();
+        let mut dds = Vec::with_capacity(148 + rows * row);
+        dds.extend_from_slice(b"DDS ");
+        let mut header = [0u32; 36];
+        header[0..5].copy_from_slice(&[124, 0x81007, height, width, (row * rows) as u32]);
+        header[18..21].copy_from_slice(&[32, 4, u32::from_le_bytes(*b"DX10")]);
+        header[26] = 0x1000;
+        header[31..36].copy_from_slice(&[format, 3, 0, 1, 0]); // 2D, one array slice.
+        for value in header { dds.extend(value.to_le_bytes()); }
+        // SAFETY: the submission finished. Check the last addressed byte
+        // against the actual buffer and strip only inter-row padding.
+        unsafe {
+            if row > pitch || (start + bytes) as u64 > buffer.GetDesc().Width
+                || buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null()
+            { continue }
+            let source = std::slice::from_raw_parts(data.cast::<u8>().add(start), bytes);
+            for y in 0..rows { dds.extend_from_slice(&source[y * pitch..y * pitch + row]); }
+            buffer.Unmap(0, None);
+        }
+        if let Some(folder) = folder()
+            && let Err(error) = std::fs::write(folder.join(&name), dds)
+        {
+            tracing::warn!(name, %error, "material texture could not be saved");
+        }
     }
 }
 

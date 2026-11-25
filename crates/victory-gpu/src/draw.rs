@@ -2273,6 +2273,12 @@ impl State {
             let pages = crate::resource::placed_bytes(&resource)
                 .and_then(|len| crate::texture::trace_readable_pages(address, len));
             let shape = host.bound_shape(index);
+            if crate::capture::material_frame(frame)
+                && let Some(copy) = crate::resource::placed_copy(address, &resource)
+                && host.shows(index, &copy.texture) == Some(true)
+            {
+                crate::capture::note_material(frame, &record.shader, word, index, &desc, copy);
+            }
             tracing::info!(frame, shader = %record.shader, offset, word, index, ?shape, ?pages,
                 requested = %describe(Some(&view)), "material texture record");
         }
