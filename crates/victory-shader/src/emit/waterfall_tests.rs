@@ -282,7 +282,7 @@ fn named_mip_gathers_preserve_tap_order_offsets_and_sampler_edges() {
 fn a_compute_sample_probe_distinguishes_filtered_shadow_from_nearest_depth() {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let texels = [0.25, 0.5, 0.75, 1.0];
-    let mut header = [0; 18];
+    let mut header = [0; 2 + 3 * super::PIXEL_SAMPLE_WORDS as usize];
     header[1] = 1;
     for (opcode, first_coord, filter, reference, expected) in [
         (0xf09c_0108, 3, D3D12_FILTER_MIN_MAG_MIP_LINEAR, 0.0f32, 0.625f32),
@@ -294,7 +294,8 @@ fn a_compute_sample_probe_distinguishes_filtered_shadow_from_nearest_depth() {
             0x7e04_02ff, 0.6f32.to_bits(), 0x7e06_02f0, 0x7e08_02f0, // reference, U, V
             opcode, 0x0043_0800 | first_coord, 0xbf81_0000,
         ];
-        let probe = super::ComputeProbe { pc: 48, coord_regs: [0, 0], pixel: [0, 0] };
+        // v0 is the local thread ID. v3 holds the bit pattern for 0.5 on all lanes.
+        let probe = super::ComputeProbe { pc: 48, coord_regs: [0, 3], span: [3, 5, 0.5f32.to_bits()] };
         let native = table_program(&words, false, RootType::Table);
         let shader = super::with_compute_probes(&[probe], || host_shader(lower_native(&native)));
         assert_eq!(shader.root_uavs, [super::SLOT_PIXEL_SAMPLES]);
@@ -312,10 +313,17 @@ fn a_compute_sample_probe_distinguishes_filtered_shadow_from_nearest_depth() {
                 views: &[View::Depth32(2, 2, &texels), View::RawUavData(&header)],
                 samplers: &[sampler], groups: [1; 3],
             }).unwrap();
-            let row = &output[0];
-            assert_eq!(row[0], 1);
-            assert_eq!(&row[6..10], &[0.5f32.to_bits(), 0.5f32.to_bits(), reference.to_bits(), expected.to_bits()]);
-            assert_eq!(&row[10..13], &[2, 2, 1.0f32.to_bits()]);
+            let records = &output[0];
+            assert_eq!(records[0], 3);
+            let mut xs = Vec::new();
+            for row in records[2..].chunks_exact(super::PIXEL_SAMPLE_WORDS as usize) {
+                xs.push(row[1]);
+                assert_eq!(&row[4..8], &[0.5f32.to_bits(), 0.5f32.to_bits(), reference.to_bits(), expected.to_bits()]);
+                assert_eq!(&row[8..11], &[2, 2, 1.0f32.to_bits()]);
+                assert_eq!(row[12..16], texels.map(f32::to_bits));
+            }
+            xs.sort_unstable();
+            assert_eq!(xs, [3, 4, 5]);
         }
     }
 }

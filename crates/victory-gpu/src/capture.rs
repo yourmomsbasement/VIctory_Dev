@@ -166,7 +166,7 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    let Some(folder) = folder() else { return };
+    if folder().is_none() { return; }
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -182,16 +182,22 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
+    save_png(name, w, h, [8, 2], &raw);
+}
+
+fn save_png(name: &str, w: u32, h: u32, format: [u8; 2], raw: &[u8]) {
+    let Some(folder) = folder() else { return };
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
     header.extend(h.to_be_bytes());
-    header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
+    header.extend(format); // channel depth and PNG color type
+    header.extend([0; 3]);
     chunk(&mut png, b"IHDR", &header);
     chunk(
         &mut png,
         b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
+        &miniz_oxide::deflate::compress_to_vec_zlib(raw, 3),
     );
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
@@ -208,6 +214,32 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend(data);
     let crc = crc32(&png[start..]);
     png.extend(crc.to_be_bytes());
+}
+
+/// PNG stores 16-bit samples most significant byte first. GPU rows may
+/// have alignment padding between them and none after the final texel.
+fn depth16_rows(w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+    let bytes = w.checked_mul(2)?;
+    if w == 0 || h == 0 || bytes > pitch || (h - 1).checked_mul(pitch)?.checked_add(bytes)? > rows.len() {
+        return None;
+    }
+    let mut raw = Vec::with_capacity((bytes + 1).checked_mul(h)?);
+    for y in 0..h {
+        raw.push(0);
+        for value in rows[y * pitch..y * pitch + bytes].chunks_exact(2) {
+            raw.extend([value[1], value[0]]);
+        }
+    }
+    Some(raw)
+}
+
+fn depth16_extent() -> Option<(u32, u32)> {
+    static EXTENT: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    *EXTENT.get_or_init(|| {
+        let s = std::env::var("VICTORY_CAPTURE_DEPTH16").ok()?;
+        let (w, h) = s.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?))
+    })
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -558,7 +590,7 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), buffer.GetDesc().Width as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -591,6 +623,11 @@ fn dump_one(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
+            if format == DXGI_FORMAT_D16_UNORM && depth16_extent() == Some((f.Width, f.Height))
+                && let Some(raw) = depth16_rows(f.Width as usize, f.Height as usize, pitch, rows)
+            {
+                save_png(&format!("{name}-depth16"), f.Width, f.Height, [16, 0], &raw);
+            }
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
@@ -982,6 +1019,15 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn native_depth_rows_keep_adjacent_depths_and_skip_padding() {
+        let rows = [0xff, 0x7f, 0x00, 0x80, 0xbe, 0xef, 0x01, 0x80, 0xff, 0xff];
+        assert_eq!(super::depth16_rows(2, 2, 6, &rows).unwrap(),
+                   [0, 0x7f, 0xff, 0x80, 0, 0, 0x80, 1, 0xff, 0xff]);
+        assert!(super::depth16_rows(2, 2, 6, &rows[..9]).is_none());
+        assert!(super::depth16_rows(2, 2, 3, &rows).is_none());
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,

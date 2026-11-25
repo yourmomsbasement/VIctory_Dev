@@ -103,7 +103,7 @@ fn a_compute_fmac_probe_records_the_selected_pixel_and_preserves_its_result() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // v_fmac_f32 v3, s0, v2 at byte 28, then copy the result to the output.
     let body = [0x5606_0400, vop1(1, 0, vgpr(3))];
-    let probe = super::ComputeProbe { pc: 28, coord_regs: [0, 4], pixel: [0, 212] };
+    let probe = super::ComputeProbe { pc: 28, coord_regs: [0, 4], span: [0, 0, 212] };
     let shader = super::with_compute_probes(&[probe], || build_valu_cs(&body));
     assert_eq!(shader.root_uavs, [super::SLOT_PIXEL_SAMPLES]);
     let mut ran = false;

@@ -4,7 +4,7 @@
 //! dumps on subsequent material capture frames in the same descriptor heap.
 //! VICTORY_TRACE_COMPUTE_VALUES accepts semicolon-separated entries such as
 //! hash:7d50:0,1@320,212 for a native instruction, two coordinate VGPRs
-//! and a pixel. The record holds the multiply-accumulate operands or the
+//! and a pixel (or a row span such as 290-410,212). The record holds the multiply-accumulate operands or the
 //! UV, reference/LOD, sampled red channel and nearest clamped mip-zero texel.
 use crate::host::{HostList, host, transition};
 use std::collections::BTreeMap;
@@ -154,10 +154,13 @@ pub(crate) fn compute_probes(hash: &str) -> Option<&'static [victory_shader::emi
                 let (pc, regs) = rest.split_once(':')?;
                 let (rx, ry) = regs.split_once(',')?;
                 let (x, y) = pixel.split_once(',')?;
+                let (first, last) = x.split_once('-').unwrap_or((x, x));
+                let span = [first.parse().ok()?, last.parse().ok()?, y.parse().ok()?];
+                if span[0] > span[1] { return None; }
                 let probe = ComputeProbe {
                     pc: usize::from_str_radix(pc.trim_start_matches("0x"), 16).ok()?,
                     coord_regs: [rx.parse().ok()?, ry.parse().ok()?],
-                    pixel: [x.parse().ok()?, y.parse().ok()?],
+                    span,
                 };
                 Some((shader.to_ascii_lowercase(), probe))
             }).fold(BTreeMap::new(), |mut by_shader, (hash, probe)| {
@@ -286,7 +289,7 @@ impl Samples {
             let mut file = BufWriter::new(file);
             if header {
                 if draw.compute_shader.is_some() {
-                    let _ = writeln!(file, "probe\tshader\tpc\tx\ty\top\ta_or_u\tb_or_v\taccumulator_or_reference_lod\tresult\twidth\theight\tnearest_clamped_mip0\theap_index");
+                    let _ = writeln!(file, "probe\tshader\tpc\tx\ty\top\ta_or_u\tb_or_v\taccumulator_or_reference_lod\tresult\twidth\theight\tnearest_clamped_mip0\theap_index\tclamp_top_left\tclamp_top_right\tclamp_bottom_left\tclamp_bottom_right");
                 } else {
                     let _ = writeln!(file, "probe\tpc\tx\tdepth\tu\tv\tr\tg\tb\ta\theap_index\ttable_slot\ttable_dword\twidth\theight\tmips\timplicit_lod");
                 }
@@ -316,9 +319,10 @@ impl Samples {
                         let _ = write!(file, "{}\t{shader}\t{:x}\t{}\t{}\t{op}\t{a}\t{b}\t{acc}\t{result}",
                             draw.id, row[0], row[1], row[2]);
                         if row[3] == 0 {
-                            let _ = writeln!(file, "\t-\t-\t-\t-");
+                            let _ = writeln!(file, "\t-\t-\t-\t-\t-\t-\t-\t-");
                         } else {
-                            let _ = writeln!(file, "\t{}\t{}\t{}\t{}", row[8], row[9], f32::from_bits(row[10]), row[11]);
+                            let [tl, tr, bl, br] = [12, 13, 14, 15].map(|i| f32::from_bits(row[i]));
+                            let _ = writeln!(file, "\t{}\t{}\t{}\t{}\t{tl}\t{tr}\t{bl}\t{br}", row[8], row[9], f32::from_bits(row[10]), row[11]);
                         }
                         continue;
                     }

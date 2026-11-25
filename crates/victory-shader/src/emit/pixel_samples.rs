@@ -126,8 +126,10 @@ impl Lower<'_> {
         let [x, y] = probe.coord_regs.map(|r| inst.read(Reg::V(r)));
         let x = self.i32_of(x.ok_or("a compute trace without its X coordinate")?)?;
         let y = self.i32_of(y.ok_or("a compute trace without its Y coordinate")?)?;
-        let [want_x, want_y] = probe.pixel.map(|n| self.s.m.i32(n));
-        let on_x = self.s.m.cmp(self.cur, pred::EQ, x, want_x);
+        let [first, last, want_y] = probe.span.map(|n| self.s.m.i32(n));
+        let left = self.s.m.cmp(self.cur, pred::IUGE, x, first);
+        let right = self.s.m.cmp(self.cur, pred::IULE, x, last);
+        let on_x = self.s.m.bin(self.cur, Bin::And, left, right);
         let on_y = self.s.m.cmp(self.cur, pred::EQ, y, want_y);
         let mut inside = self.s.m.bin(self.cur, Bin::And, on_x, on_y);
         if let Some(active) = guard {
@@ -137,14 +139,16 @@ impl Lower<'_> {
             let pc = lower.s.m.i32(probe.pc as u32);
             let zero = lower.s.m.i32(0);
             let op = lower.s.m.i32(texture.map_or(0, |(_, op)| op));
-            let extra = texture.map_or([zero; 4], |(h, _)| lower.probe_texel(h, operands[0], operands[1]));
-            [[pc, x, y, op], operands.map(|v| lower.as_int(v)), extra, [zero; 4]]
+            let (view, taps) = texture.map_or(([zero; 4], [zero; 4]), |(h, _)| {
+                lower.probe_texels(h, operands[0], operands[1])
+            });
+            [[pc, x, y, op], operands.map(|v| lower.as_int(v)), view, taps]
         });
         Ok(())
     }
 
-    /// Read the nearest clamped texel at mip zero independently of the sampler.
-    fn probe_texel(&mut self, h: V, u: V, v: V) -> [V; 4] {
+    /// Load the four clamped texels around the sample while the SRV is bound.
+    fn probe_texels(&mut self, h: V, u: V, v: V) -> ([V; 4], [V; 4]) {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let f32t = self.s.t.f32;
@@ -154,19 +158,35 @@ impl Lower<'_> {
         let ty = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
         let dims = self.s.op(c, "getDimensions", Attr::ReadOnly, ty, 72, &[h, zero]);
         let [width, height] = [0, 1].map(|k| self.s.m.extract(c, dims, k));
-        let [x, y] = [(u, width), (v, height)].map(|(coord, size)| {
+        let half = self.s.m.f32(0.5f32.to_bits());
+        let [(xs, right), (ys, bottom)] = [(u, width), (v, height)].map(|(coord, size)| {
             let bound = self.s.op(c, "unary.f32", Attr::ReadNone, f32t, 7, &[coord]);
             let dim = self.s.m.cast(c, Cast::UiToFp, size, f32t);
             let at = self.s.m.bin(c, Bin::Mul, bound, dim);
-            let at = self.s.m.cast(c, Cast::FpToUi, at, i32t);
+            let center = self.s.m.bin(c, Bin::Sub, at, half);
+            let floor = self.s.op(c, "unary.f32", Attr::ReadNone, f32t, 27, &[center]);
+            let fraction = self.s.m.bin(c, Bin::Sub, center, floor);
+            let upper = self.s.m.cmp(c, pred::OGE, fraction, half);
+            let low = self.s.m.cast(c, Cast::FpToSi, floor, i32t);
+            let high = self.s.m.bin(c, Bin::Add, low, one);
             let last = self.s.m.bin(c, Bin::Sub, size, one);
-            self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[at, last])
+            let pair = [low, high].map(|p| {
+                let p = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 37, &[p, zero]);
+                self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[p, last])
+            });
+            (pair, upper)
         });
-        let sample = self.s.op(c, "textureLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 66,
-            &[h, zero, x, y, undef, undef, undef, undef]);
-        let first = self.s.m.extract(c, sample, 0);
+        let taps = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(x, y)| {
+            let sample = self.s.op(c, "textureLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 66,
+                &[h, zero, xs[x], ys[y], undef, undef, undef, undef]);
+            let red = self.s.m.extract(c, sample, 0);
+            self.as_int(red)
+        });
+        let top = self.s.m.select(c, right, taps[1], taps[0]);
+        let lower = self.s.m.select(c, right, taps[3], taps[2]);
+        let nearest = self.s.m.select(c, bottom, lower, top);
         let unknown = self.s.m.i32(u32::MAX);
         let heap = self.s.sample_indices.get(&h).copied().unwrap_or(unknown);
-        [width, height, self.as_int(first), heap]
+        ([width, height, nearest, heap], taps)
     }
 }

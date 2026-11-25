@@ -247,13 +247,13 @@ pub const SLOT_PIXEL_SAMPLES: u8 = 251;
 pub const MAX_PIXEL_SAMPLES: u32 = 2048;
 #[cfg(feature = "diagnostics")]
 pub const PIXEL_SAMPLE_WORDS: u32 = 16;
-/// Capture a compute instruction at one output pixel addressed by two VGPRs.
+/// Capture a compute instruction on an inclusive span of one output row.
 #[cfg(feature = "diagnostics")]
 #[derive(Clone, Copy)]
 pub struct ComputeProbe {
     pub pc: usize,
     pub coord_regs: [u8; 2],
-    pub pixel: [u32; 2],
+    pub span: [u32; 3], // first X, last X, Y
 }
 #[cfg(feature = "diagnostics")]
 thread_local! {
