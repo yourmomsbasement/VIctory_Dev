@@ -199,6 +199,14 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             };
         }
         if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+            #[cfg(feature = "diagnostics")]
+            if matches!(name, "v_fmac_f32" | "image_sample_c_lz" | "image_sample_lz")
+                && let Some(probe) = crate::emit::compute_probe_at(machine.offset)
+            {
+                for reg in probe.coord_regs.map(Reg::V) {
+                    if !reads.contains(&reg) { reads.push(reg); }
+                }
+            }
             // Lanes disabled in EXEC keep the old value.
             for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
                 if !reads.contains(w) {

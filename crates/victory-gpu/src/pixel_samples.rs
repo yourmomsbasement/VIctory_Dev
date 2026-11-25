@@ -1,7 +1,11 @@
-//! GPU values from selected 2D sample instructions. Set
+//! GPU values from selected pixel samples and compute instructions. Set
 //! VICTORY_TRACE_PIXEL_SAMPLES=container-hash@first-x-last-x,y.
 //! VICTORY_DUMP_SAMPLE_PC selects one instruction for placed texture and mip
 //! dumps on subsequent material capture frames in the same descriptor heap.
+//! VICTORY_TRACE_COMPUTE_VALUES accepts semicolon-separated entries such as
+//! hash:7d50:0,1@320,212 for a native instruction, two coordinate VGPRs
+//! and a pixel. The record holds the multiply-accumulate operands or the
+//! UV, reference/LOD, sampled red channel and nearest clamped mip-zero texel.
 use crate::host::{HostList, host, transition};
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
@@ -138,12 +142,39 @@ pub(crate) fn selected() -> Option<&'static (String, [u32; 3])> {
     .as_ref()
 }
 
+/// Semicolon-separated hash:hex-pc:x-vgpr,y-vgpr@pixel-x,pixel-y entries.
+pub(crate) fn compute_probes(hash: &str) -> Option<&'static [victory_shader::emit::ComputeProbe]> {
+    use victory_shader::emit::ComputeProbe;
+    static PROBES: OnceLock<BTreeMap<String, Vec<ComputeProbe>>> = OnceLock::new();
+    let probes = PROBES.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_COMPUTE_VALUES").unwrap_or_default()
+            .split(';').filter_map(|item| {
+                let (site, pixel) = item.trim().split_once('@')?;
+                let (shader, rest) = site.split_once(':')?;
+                let (pc, regs) = rest.split_once(':')?;
+                let (rx, ry) = regs.split_once(',')?;
+                let (x, y) = pixel.split_once(',')?;
+                let probe = ComputeProbe {
+                    pc: usize::from_str_radix(pc.trim_start_matches("0x"), 16).ok()?,
+                    coord_regs: [rx.parse().ok()?, ry.parse().ok()?],
+                    pixel: [x.parse().ok()?, y.parse().ok()?],
+                };
+                Some((shader.to_ascii_lowercase(), probe))
+            }).fold(BTreeMap::new(), |mut by_shader, (hash, probe)| {
+                by_shader.entry(hash).or_insert_with(Vec::new).push(probe);
+                by_shader
+            })
+    });
+    probes.get(hash).map(Vec::as_slice)
+}
+
 struct Draw {
     id: u64,
     frame: u64,
     buffer: ID3D12Resource,
     readback: Option<ID3D12Resource>,
     views: Option<SampledViews>,
+    compute_shader: Option<String>,
 }
 
 #[derive(Default)]
@@ -155,6 +186,7 @@ impl Samples {
         list: &HostList,
         frame: u64,
         heap: Option<&crate::descriptor::Heap>,
+        compute_shader: Option<&str>,
     ) -> Option<(u64, Option<u64>)> {
         let save = crate::capture::listed(frame) && crate::capture::folder().is_some();
         let mut draws = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -194,11 +226,12 @@ impl Samples {
             frame,
             buffer,
             readback,
-            views: if save {
+            views: if save && compute_shader.is_none() {
                 heap.and_then(|h| note_views(h, frame))
             } else {
                 None
             },
+            compute_shader: compute_shader.map(str::to_owned),
         });
         Some((address, save.then_some(id)))
     }
@@ -240,7 +273,8 @@ impl Samples {
             let Some(readback) = &draw.readback else {
                 continue;
             };
-            let path = dir.join(format!("frame-{}-pixel-samples.tsv", draw.frame));
+            let kind = if draw.compute_shader.is_some() { "compute-values" } else { "pixel-samples" };
+            let path = dir.join(format!("frame-{}-{kind}.tsv", draw.frame));
             let Ok(file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -251,10 +285,11 @@ impl Samples {
             let header = file.metadata().is_ok_and(|m| m.len() == 0);
             let mut file = BufWriter::new(file);
             if header {
-                let _ = writeln!(
-                    file,
-                    "probe\tpc\tx\tdepth\tu\tv\tr\tg\tb\ta\theap_index\ttable_slot\ttable_dword\twidth\theight\tmips\timplicit_lod"
-                );
+                if draw.compute_shader.is_some() {
+                    let _ = writeln!(file, "probe\tshader\tpc\tx\ty\top\ta_or_u\tb_or_v\taccumulator_or_reference_lod\tresult\twidth\theight\tnearest_clamped_mip0\theap_index");
+                } else {
+                    let _ = writeln!(file, "probe\tpc\tx\tdepth\tu\tv\tr\tg\tb\ta\theap_index\ttable_slot\ttable_dword\twidth\theight\tmips\timplicit_lod");
+                }
             }
             let mut data = std::ptr::null_mut();
             // SAFETY: the submission fence covers the copy. The shader writes
@@ -275,6 +310,18 @@ impl Samples {
                     .chunks_exact(PIXEL_SAMPLE_WORDS as usize)
                     .take(words[0] as usize)
                 {
+                    if let Some(shader) = &draw.compute_shader {
+                        let [a, b, acc, result] = [4, 5, 6, 7].map(|i| f32::from_bits(row[i]));
+                        let op = match row[3] { 0 => "fmac", 62 => "sample_lz", 65 => "sample_c_lz", _ => "unknown" };
+                        let _ = write!(file, "{}\t{shader}\t{:x}\t{}\t{}\t{op}\t{a}\t{b}\t{acc}\t{result}",
+                            draw.id, row[0], row[1], row[2]);
+                        if row[3] == 0 {
+                            let _ = writeln!(file, "\t-\t-\t-\t-");
+                        } else {
+                            let _ = writeln!(file, "\t{}\t{}\t{}\t{}", row[8], row[9], f32::from_bits(row[10]), row[11]);
+                        }
+                        continue;
+                    }
                     if row[3] != u32::MAX
                         && Some(row[0]) == dump_pc()
                         && let Some(views) = &draw.views

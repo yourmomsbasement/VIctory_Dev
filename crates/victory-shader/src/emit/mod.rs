@@ -247,9 +247,33 @@ pub const SLOT_PIXEL_SAMPLES: u8 = 251;
 pub const MAX_PIXEL_SAMPLES: u32 = 2048;
 #[cfg(feature = "diagnostics")]
 pub const PIXEL_SAMPLE_WORDS: u32 = 16;
+/// Capture a compute instruction at one output pixel addressed by two VGPRs.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+pub struct ComputeProbe {
+    pub pc: usize,
+    pub coord_regs: [u8; 2],
+    pub pixel: [u32; 2],
+}
 #[cfg(feature = "diagnostics")]
 thread_local! {
     static SAMPLE_SPAN: std::cell::Cell<Option<[u32; 3]>> = const { std::cell::Cell::new(None) };
+    static COMPUTE_PROBES: std::cell::RefCell<Vec<ComputeProbe>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn compute_probe_at(pc: usize) -> Option<ComputeProbe> {
+    COMPUTE_PROBES.with_borrow(|probes| probes.iter().find(|p| p.pc == pc).copied())
+}
+
+#[cfg(feature = "diagnostics")]
+pub fn with_compute_probes<T>(probes: &[ComputeProbe], f: impl FnOnce() -> T) -> T {
+    struct Restore(Vec<ComputeProbe>);
+    impl Drop for Restore {
+        fn drop(&mut self) { COMPUTE_PROBES.replace(std::mem::take(&mut self.0)); }
+    }
+    let _restore = Restore(COMPUTE_PROBES.replace(probes.to_vec()));
+    f()
 }
 
 #[cfg(feature = "diagnostics")]

@@ -68,6 +68,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_F16_NEAREST",
                     "VICTORY_MATERIAL_IDS",
                     "VICTORY_TRACE_PIXEL_SAMPLES",
+                    "VICTORY_TRACE_COMPUTE_VALUES",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -105,9 +106,14 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
             victory_shader::emit::translate(c)
         };
         #[cfg(feature = "diagnostics")]
+        let digest = blake3::hash(c).to_hex();
+        #[cfg(feature = "diagnostics")]
         let shader = match crate::pixel_samples::selected() {
-            Some((hash, span)) if blake3::hash(c).to_hex()[..16] == **hash => {
+            Some((hash, span)) if digest[..16] == **hash => {
                 victory_shader::emit::with_sample_span(*span, run)
+            }
+            _ if let Some(probes) = crate::pixel_samples::compute_probes(&digest[..16]) => {
+                victory_shader::emit::with_compute_probes(probes, run)
             }
             _ => run(),
         };

@@ -146,6 +146,14 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 }
 
 fn build_with_view_root(words: &[u32], buffers: bool, view_root: RootType) -> HostShader {
+    let lowered = lower_native(&table_program(words, buffers, view_root));
+    // One access with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, 1);
+    assert!(!lowered.wave_ops);
+    host_shader(lowered)
+}
+
+fn table_program(words: &[u32], buffers: bool, view_root: RootType) -> NativeProgram {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -169,7 +177,7 @@ fn build_with_view_root(words: &[u32], buffers: bool, view_root: RootType) -> Ho
     } else {
         range(ResourceType::Srv, 0, 8, 0, 0)
     };
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
@@ -184,12 +192,7 @@ fn build_with_view_root(words: &[u32], buffers: bool, view_root: RootType) -> Ho
             threads: [32, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let lowered = lower_native(&native);
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
-    host_shader(lowered)
+    }
 }
 
 fn lower_native(native: &NativeProgram) -> lower::Lowered {
@@ -271,6 +274,49 @@ fn named_mip_gathers_preserve_tap_order_offsets_and_sampler_edges() {
             assert_eq!(taps, expected, "{label} mode={mode:?} offset={offset:?} uv={uv} lod={lod}");
         }
         eprintln!("validated named-mip gather taps on {label}");
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn a_compute_sample_probe_distinguishes_filtered_shadow_from_nearest_depth() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let texels = [0.25, 0.5, 0.75, 1.0];
+    let mut header = [0; 18];
+    header[1] = 1;
+    for (opcode, first_coord, filter, reference, expected) in [
+        (0xf09c_0108, 3, D3D12_FILTER_MIN_MAG_MIP_LINEAR, 0.0f32, 0.625f32),
+        (0xf0bc_0108, 2, D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR, 0.6, 0.5),
+    ] {
+        let words = [
+            0xbe84_0300, 0xbe85_0380, 0xbe86_0301, 0xbe87_0380, // view and sampler tables
+            0xf408_0203, 0xfa00_0000, 0xf40c_0302, 0xfa00_0000, // sampler and texture
+            0x7e04_02ff, 0.6f32.to_bits(), 0x7e06_02f0, 0x7e08_02f0, // reference, U, V
+            opcode, 0x0043_0800 | first_coord, 0xbf81_0000,
+        ];
+        let probe = super::ComputeProbe { pc: 48, coord_regs: [0, 0], pixel: [0, 0] };
+        let native = table_program(&words, false, RootType::Table);
+        let shader = super::with_compute_probes(&[probe], || host_shader(lower_native(&native)));
+        assert_eq!(shader.root_uavs, [super::SLOT_PIXEL_SAMPLES]);
+        let sampler = D3D12_SAMPLER_DESC {
+            Filter: filter, ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, MaxAnisotropy: 1, ..Default::default()
+        };
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let output = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize])),
+                            (1, Root::Uav(0))],
+                views: &[View::Depth32(2, 2, &texels), View::RawUavData(&header)],
+                samplers: &[sampler], groups: [1; 3],
+            }).unwrap();
+            let row = &output[0];
+            assert_eq!(row[0], 1);
+            assert_eq!(&row[6..10], &[0.5f32.to_bits(), 0.5f32.to_bits(), reference.to_bits(), expected.to_bits()]);
+            assert_eq!(&row[10..13], &[2, 2, 1.0f32.to_bits()]);
+        }
     }
 }
 

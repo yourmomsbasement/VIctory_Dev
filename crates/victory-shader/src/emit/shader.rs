@@ -445,7 +445,9 @@ impl Shader {
         );
         let handle = self.annotate(block, h, props.0, props.1);
         #[cfg(feature = "diagnostics")]
-        if self.pixel && !sampler && (1..=9).contains(&props.0) && super::SAMPLE_SPAN.get().is_some() {
+        if !sampler && (1..=9).contains(&props.0)
+            && ((self.pixel && super::SAMPLE_SPAN.get().is_some())
+                || super::COMPUTE_PROBES.with_borrow(|probes| !probes.is_empty())) {
             self.sample_indices.insert(handle, index);
         }
         handle

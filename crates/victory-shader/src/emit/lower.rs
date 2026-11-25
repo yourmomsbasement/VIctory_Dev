@@ -7369,7 +7369,17 @@ impl<'a> Lower<'a> {
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                 };
-                float(self, r)
+                float(self, r)?;
+                #[cfg(feature = "diagnostics")]
+                if name == "v_fmac_f32"
+                    && let Some(probe) = super::compute_probe_at(inst.machine.offset)
+                    && let Some(Operand::Vector { reg, .. }) = v.dst
+                    && let Some(dst) = inst.write(Reg::V(reg))
+                {
+                    let result = self.float_of(dst)?;
+                    self.trace_compute(inst, probe, [a, bb, acc, result], guard, None)?;
+                }
+                Ok(())
             }
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
@@ -9741,6 +9751,8 @@ impl<'a> Lower<'a> {
         let mut gathered: Option<[V; 4]> = None;
         #[cfg(feature = "diagnostics")]
         let mut sample_uv = None;
+        #[cfg(feature = "diagnostics")]
+        let mut compute_sample = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -10050,6 +10062,12 @@ impl<'a> Lower<'a> {
                 64 | 65 => {
                     let reference = addr_u32(self, first - 1)?;
                     let reference = self.as_float(reference);
+                    #[cfg(feature = "diagnostics")]
+                    if kind == 2 && name == "image_sample_c_lz"
+                        && let Some(probe) = super::compute_probe_at(inst.machine.offset)
+                    {
+                        compute_sample = Some((probe, [cs[0], cs[1], reference], 65));
+                    }
                     args.extend(&os);
                     args.push(reference);
                     let name = if op == 64 {
@@ -10070,6 +10088,12 @@ impl<'a> Lower<'a> {
                     };
                     args.extend(&os);
                     args.push(lod);
+                    #[cfg(feature = "diagnostics")]
+                    if kind == 2 && name == "image_sample_lz"
+                        && let Some(probe) = super::compute_probe_at(inst.machine.offset)
+                    {
+                        compute_sample = Some((probe, [cs[0], cs[1], lod], 62));
+                    }
                     self.s.op(
                         c,
                         "sampleLevel.f32",
@@ -10190,6 +10214,11 @@ impl<'a> Lower<'a> {
         }
         for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some((probe, [u, v, reference], op)) = compute_sample {
+            let result = self.s.m.extract(self.cur, r, 0);
+            self.trace_compute(inst, probe, [u, v, reference, result], guard, Some((h, op)))?;
         }
         #[cfg(feature = "diagnostics")]
         if let Some(uv) = sample_uv {

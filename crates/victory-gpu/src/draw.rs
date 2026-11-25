@@ -1129,10 +1129,15 @@ impl State {
                 if slot == victory_shader::emit::SLOT_PIXEL_SAMPLES {
                     let frame = crate::queue::presented() + 1;
                     let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
-                    let Some((address, id)) = list.pixel_samples.bind(list, frame, heap) else { return false };
-                    self.pixel_sample = id;
-                    // SAFETY: the instrumented pixel stage declares this root UAV.
-                    unsafe { l.SetGraphicsRootUnorderedAccessView(param, address) };
+                    let shader = compute.then_some(stage.shader.hash.as_str());
+                    let Some((address, id)) = list.pixel_samples.bind(list, frame, heap, shader) else { return false };
+                    // SAFETY: the instrumented stage declares this root UAV.
+                    if compute {
+                        unsafe { l.SetComputeRootUnorderedAccessView(param, address) };
+                    } else {
+                        self.pixel_sample = id;
+                        unsafe { l.SetGraphicsRootUnorderedAccessView(param, address) };
+                    }
                     continue;
                 }
                 if slot == victory_shader::emit::SLOT_TEXTURE_READS {

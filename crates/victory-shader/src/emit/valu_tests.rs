@@ -97,6 +97,45 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     build_cs(body, 1, 0)
 }
 
+#[cfg(feature = "diagnostics")]
+#[test]
+fn a_compute_fmac_probe_records_the_selected_pixel_and_preserves_its_result() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // v_fmac_f32 v3, s0, v2 at byte 28, then copy the result to the output.
+    let body = [0x5606_0400, vop1(1, 0, vgpr(3))];
+    let probe = super::ComputeProbe { pc: 28, coord_regs: [0, 4], pixel: [0, 212] };
+    let shader = super::with_compute_probes(&[probe], || build_valu_cs(&body));
+    assert_eq!(shader.root_uavs, [super::SLOT_PIXEL_SAMPLES]);
+    let mut ran = false;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        ran = true;
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for (y, enabled) in [(212, 1), (211, 1), (212, 0)] {
+            let inputs = [0.25f32.to_bits(), 0.5f32.to_bits(), 0.75f32.to_bits(), y];
+            let mut constants = vec![0; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Constants { constants[u.index as usize] = inputs[u.dword as usize]; }
+            }
+            let mut header = [0; 18];
+            header[1] = enabled;
+            let output = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(constants)), (1, Root::Uav(1))],
+                views: &[View::RawUav(1), View::RawUavData(&header)],
+                samplers: &[], groups: [1, 1, 1],
+            }).unwrap();
+            assert_eq!(output[0][0], 0.875f32.to_bits());
+            let records = &output[1];
+            assert_eq!(records[0], u32::from(y == 212 && enabled == 1));
+            if records[0] == 1 {
+                assert_eq!(&records[2..5], &[28, 0, 212]);
+                assert_eq!(&records[6..10], &[inputs[0], inputs[1], inputs[2], output[0][0]]);
+            }
+        }
+    }
+    assert!(ran, "no SM 6.6 compute device");
+}
+
 #[test]
 fn a_vector_load_resolves_each_title_page_and_reports_the_missing_half() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
