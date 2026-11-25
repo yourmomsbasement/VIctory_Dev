@@ -648,6 +648,78 @@ fn the_builder_copies_a_multi_iteration_structure_on_the_card() {
 
 #[test]
 #[ignore = "requires VICTORY_TEST_BVH_BUILDER pointing to the title's builder DLL"]
+fn the_world_builder_resets_only_the_requested_counter_records() {
+    let shader = builder_stage(b"DXBC\x5d\x13\x8a\x3d\xb6\x34\x50\x36\x64\x30\x96\x84\xf1\xaf\x67\xa2");
+    assert_eq!(shader.root_uavs, [1]);
+    assert!(shader.root_srvs.is_empty() && shader.root_cbvs.is_empty());
+    let count = 67u32; // partial third group
+    let bias = 12u32;
+    let value = 0x175a_b801;
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        constants[u.index as usize] = match (u.slot, u.root, u.dword) {
+            (2, RootType::Constants, 1) => count,
+            (2, RootType::Constants, 2) => value,
+            (2, RootType::Constants, _) => 0,
+            (1, RootType::Other(super::USER_VIEW_BIAS), _) => bias,
+            other => panic!("unexpected reset argument {other:?}"),
+        };
+    }
+    let before = vec![0xcdcd_cdcd; 4 * 96 + 3];
+    let mut want = before.clone();
+    want[3..3 + 4 * count as usize].fill(value);
+    for warp in [true, false] {
+        let host = Host::new(warp).expect("adapter");
+        let (root, pso) = host.compute_pipeline(&shader).expect("reset pipeline");
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants.clone())), (1, Root::Uav(0))],
+            views: &[View::RawUavData(&before)], samplers: &[], groups: [3, 1, 1],
+        }).expect("reset counters");
+        assert_eq!(out[0], want);
+    }
+}
+
+#[test]
+#[ignore = "requires VICTORY_TEST_BVH_BUILDER pointing to the title's builder DLL"]
+fn the_world_builder_copies_for_update_and_optionally_resets_bounds() {
+    let shader = builder_stage(b"DXBC\x60\xa9\x39\x6f\xb6\x2c\x89\xfe\xa9\x9b\x32\x73\x72\xe9\xdd\x9e");
+    assert_eq!(shader.root_srvs, [0]);
+    assert_eq!(shader.root_uavs, [1]);
+    assert!(shader.root_cbvs.is_empty());
+    let mut source: Vec<u32> = (0..304).map(|i| 0x1234_0000 + i).collect();
+    source[1] = 17; // 64-byte header + 17 nodes, followed by a guard
+    let end = 16 + 17 * 16;
+    for warp in [true, false] {
+        let host = Host::new(warp).expect("adapter");
+        let (root, pso) = host.compute_pipeline(&shader).expect("update pipeline");
+        for reset in [false, true] {
+            let mut constants = vec![0; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                constants[u.index as usize] = match (u.slot, u.root, u.dword) {
+                    (2, RootType::Constants, 0) => 64, // two groups of 32
+                    (2, RootType::Constants, 1) => u32::from(reset),
+                    (2, RootType::Constants, _) | (0 | 1, RootType::Other(super::USER_VIEW_BIAS), _) => 0,
+                    other => panic!("unexpected update argument {other:?}"),
+                };
+            }
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(constants)), (1, Root::View { srv: true, data: source.clone() }),
+                            (2, Root::Uav(0))],
+                views: &[View::RawUav(source.len() as u32)], samplers: &[], groups: [2, 1, 1],
+            }).expect("copy for update");
+            let mut want = source.clone();
+            want[end..].fill(0);
+            if reset {
+                want[4..7].fill(f32::MAX.to_bits());
+                want[7..10].fill((-f32::MAX).to_bits());
+            }
+            assert_eq!(out[0], want, "copy for update, reset={reset}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires VICTORY_TEST_BVH_BUILDER pointing to the title's builder DLL"]
 fn the_builder_initializes_bounds_across_separate_page_copies() {
     let shader = builder_stage(b"DXBC\xb4\x0c\x42\x33\x3f\x8a\x98\x51\x5e\xd6\x8f\x49\xc1\xd7\x83\x97");
     assert_eq!(shader.root_srvs, [super::SLOT_MEMORY]);
