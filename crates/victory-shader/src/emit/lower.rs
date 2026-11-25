@@ -210,6 +210,9 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// Dwords of heap descriptors read as scalar data, with their load
+    /// site. Only the known texture-dimension bits can be materialized.
+    texture_words: HashMap<Value, (Site, u8)>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1586,6 +1589,7 @@ impl<'a> Lower<'a> {
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             strides: HashMap::new(),
+            texture_words: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -4963,6 +4967,17 @@ impl<'a> Lower<'a> {
                 return l.operand(inst, d);
             }
             let op = src.get(k).ok_or("a missing operand")?;
+            if k == 0 && let Operand::Scalar { code, .. } = *op
+                && let Some((site, word)) = inst.read(Reg::S(code)).and_then(|v| l.texture_words.get(&v)).copied()
+                && let Some(bits) = src.get(1).and_then(|op| match *op {
+                    Operand::Const(n) => crate::resource::inline(n),
+                    Operand::Literal(n) => Some(n),
+                    _ => None,
+                })
+                && let Some(value) = l.texture_dimension_operand(site, word, name, bits)?
+            {
+                return Ok(value);
+            }
             l.operand(inst, op)
         };
         let sext16 = |l: &mut Self| l.s.m.i32(i32::from(imm.unwrap_or(0) as i16) as u32);
@@ -5710,6 +5725,13 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            if count == 8 && address.is_some_and(|a| self.is_heap_texture_extent(site, a, code)) {
+                for word in 1..=3 {
+                    if let Some(value) = inst.write(Reg::S(code + word)) {
+                        self.texture_words.insert(value, (site, word));
+                    }
+                }
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -6303,13 +6325,93 @@ impl<'a> Lower<'a> {
         if let Some(&v) = self.strides.get(&key) {
             return Ok(Some(v));
         }
+        let v = self.slot_word(*load, *first, 0)?;
+        self.strides.insert(key, v);
+        Ok(Some(v))
+    }
+
+    /// The material shaders read a whole aligned texture descriptor and
+    /// extract its 16-bit height from bit 14 of word two. A pair of
+    /// four-dword buffer descriptors is not evidence of a texture.
+    fn is_heap_texture_extent(&self, site: Site, address: Address, code: u8) -> bool {
+        if !self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::ResourceHeap)
+            || !address.offset.is_multiple_of(32)
+        {
+            return false;
+        }
+        let block = &self.x.p.blocks[site.0].insts;
+        if let Some(offset) = address.dynamic {
+            let aligned = block[..site.1].iter().rev().any(|i| {
+                i.name() == "s_lshl_b32" && i.writes.iter().any(|&(r, v)| matches!(r, Reg::S(_)) && v == offset)
+                    && matches!(&i.fields, Fields::Sop { src, .. }
+                        if matches!(src.get(1), Some(Operand::Const(n)) if crate::resource::inline(*n).is_some_and(|v| v & 31 >= 5)))
+            });
+            if !aligned { return false; }
+        }
+        let height = block[site.1].write(Reg::S(code + 2));
+        height.is_some() && block[site.1 + 1..].iter().any(|i| {
+            i.name() == "s_bfe_u32" && matches!(&i.fields, Fields::Sop { src, .. }
+                if matches!(src.as_slice(), [Operand::Scalar { code, .. }, Operand::Literal(0x0010_000e)]
+                    if i.read(Reg::S(*code)) == height))
+        })
+    }
+
+    /// The texture descriptor packs width minus one across dwords 1 and
+    /// 2, height minus one in dword 2 and the first mip in dword 3.
+    /// Resolve only operations whose result depends entirely on these bits.
+    fn texture_dimension_operand(&mut self, site: Site, word: u8, op: &str, control: u32) -> Result<Option<V>, Why> {
+        let known: u32 = match word {
+            1 => 0xc000_0000,
+            2 => 0x3fff_ffff,
+            3 => 0x0000_f000,
+            _ => return Ok(None),
+        };
+        let read = match op {
+            "s_lshr_b32" => u32::MAX << (control & 31),
+            "s_lshl_b32" => u32::MAX >> (control & 31),
+            "s_and_b32" => control,
+            "s_bfe_u32" => {
+                let width = (control >> 16) & 0x7f;
+                if width == 0 || width > 32 { return Ok(None); }
+                (u32::MAX >> (32 - width)) << (control & 31)
+            }
+            _ => return Ok(None),
+        };
+        if read & !known != 0 { return Ok(None); }
+        let packed = self.slot_word(site, 0, super::shader::SLOT_STRIDES_COUNT)?;
         let c = self.cur;
-        let slot = self.heap_index(*load, *first, false)?;
+        let value = match word {
+            1 => {
+                let shift = self.s.m.i32(30);
+                self.s.m.bin(c, Bin::Shl, packed, shift)
+            }
+            2 => {
+                let two = self.s.m.i32(2);
+                let upper_width = self.s.m.bin(c, Bin::LShr, packed, two);
+                let mask = self.s.m.i32(0xfff);
+                let upper_width = self.s.m.bin(c, Bin::And, upper_width, mask);
+                let mask = self.s.m.i32(0x0fff_c000);
+                let height = self.s.m.bin(c, Bin::And, packed, mask);
+                self.s.m.bin(c, Bin::Or, upper_width, height)
+            }
+            _ => {
+                let shift = self.s.m.i32(16);
+                self.s.m.bin(c, Bin::LShr, packed, shift)
+            }
+        };
+        Ok(Some(value))
+    }
+
+    fn slot_word(&mut self, load: Site, first: u8, plane: u32) -> Result<V, Why> {
+        let c = self.cur;
+        let slot = self.heap_index(load, first, false)?;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
         let i32t = self.s.t.i32;
         let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        let plane = self.s.m.i32(plane);
+        let slot = self.s.m.bin(c, Bin::Add, slot, plane);
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, slot, two);
         let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
@@ -6325,9 +6427,7 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
-        self.strides.insert(key, v);
-        Ok(Some(v))
+        Ok(self.as_int(f))
     }
 
     /// The heap index of a descriptor that may differ between lanes,

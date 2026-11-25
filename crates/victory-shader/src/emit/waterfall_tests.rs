@@ -12,6 +12,55 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+#[test]
+fn heap_texture_dimensions_are_available_without_sampling() {
+    let words: &[u32] = &[
+        0xbe84_0300, 0xbe85_0380, // resource heap at s[4:5]
+        0xbe86_0301, 0xbe87_0380, // output table at s[6:7]
+        0xf40c_0502, 0xfa00_0020, // s_load_dwordx8 s[20:27], s[4:5], 32
+        0xf408_0a03, 0xfa00_0000, // s_load_dwordx4 s[40:43], s[6:7], 0
+        0xbf8c_c07f,
+        0x900c_9e15, // s_lshr_b32 s12, s21, 30
+        0x8f14_8216, // s_lshl_b32 s20, s22, 2
+        0x938f_ff16, 0x0010_000e, // height minus one from s22
+        0x8814_140c, 0x8714_ff14, 0x0000_ffff, // width minus one
+        0x938c_ff17, 0x0004_000c, // first mip from s23
+        0x7e08_0214, 0x7e0a_020f, 0x7e0c_020c, // v4..6 = width-1, height-1, mip
+        0x7e0e_0280, // v_mov_b32 v7, 0
+        0xe078_1000, 0x800a_0400, // buffer_store_dwordx4 v[4:7], v0, s[40:43], 0 offen
+        0xbf81_0000,
+    ];
+    let param = |root, slot| RootParam {
+        root, slot, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs, wave64: false, vgprs: 8,
+        layout: vec![param(RootType::ResourceHeap, 0), param(RootType::Table, 1)],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav, root: RootType::Table, table_offset_dwords: 0,
+            lower_bound: 0, stride: 0, dwords: 4, user_data: 1, slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [1, 1, 1] }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let shader = host_shader(lower_native(&native));
+    assert_eq!(shader.root_srvs, [super::SLOT_STRIDES]);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut fields = vec![0; super::SLOT_STRIDES_COUNT as usize + 2];
+        // Odd dimensions with nonzero high and low bits, and a nonzero mip.
+        fields[super::SLOT_STRIDES_COUNT as usize + 1] = 12346 | (9122 << 14) | (3 << 28);
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize])),
+                        (1, Root::View { srv: true, data: fields })],
+            views: &[View::RawUav(4)], samplers: &[], groups: [1; 3],
+        }).expect("dispatch");
+        assert_eq!(out[0][..3], [12346, 9122, 3], "{label}");
+    }
+}
+
 /// Lowers a wave32 compute program of 32 threads with the table of views at
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
@@ -55,12 +104,20 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
+    let lowered = lower_native(&native);
+    // One access with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, 1);
+    assert!(!lowered.wave_ops);
+    host_shader(lowered)
+}
+
+fn lower_native(native: &NativeProgram) -> lower::Lowered {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
+    let io = io::raise(&p, native).expect("io::raise");
+    lower::lower(&lower::Parts {
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -70,10 +127,10 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
     })
-    .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+    .expect("lower")
+}
+
+fn host_shader(lowered: lower::Lowered) -> HostShader {
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,

@@ -52,7 +52,8 @@ pub(crate) struct HostHeap {
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
-    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// two planes of `SLOT_STRIDES_COUNT` dwords, its GPU address and
+    /// its mapping. The second plane holds [`texture_extent_word`].
     strides: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
@@ -419,6 +420,35 @@ impl TextureQueue {
     }
 }
 
+/// Width minus one, height minus one and the SRV's first mip, packed into
+/// 14, 14 and 4 bits respectively. D3D12 textures are at most 16384 wide
+/// or high. Record the resource dimensions before applying the view mip.
+fn texture_extent_word(view: &View) -> Option<u32> {
+    let ((width, height), srv) = match view {
+        View::Placed(false, resource, srv) if (2..=4).contains(&resource[0]) => {
+            let width = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            ((width, resource[6]), Some(&srv[..]))
+        }
+        View::Shader(resource, srv) => {
+            let extent = crate::resource::texture_extent(*resource as crate::object::This)?;
+            (extent, srv.as_ref().map(|d| &d[..]))
+        }
+        _ => return None,
+    };
+    let mip = match srv {
+        None => 0,
+        Some(d) => match d[1] {
+            2..=5 | 8..=10 => d[4],
+            6 | 7 => 0, // multisampled textures
+            _ => return None,
+        },
+    };
+    if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) || mip > 15 {
+        return None;
+    }
+    Some((width as u32 - 1) | (height - 1) << 14 | mip << 28)
+}
+
 /// Whether `view` is of a texture the title may fill itself: a texture it
 /// placed in memory, or a texture object.
 pub(crate) fn is_texture_view(view: &View) -> bool {
@@ -608,14 +638,14 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
-                crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
+                crate::host::name(&buffer, || "buffer strides and texture dimensions by view heap slot".to_owned());
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
@@ -1041,7 +1071,12 @@ impl HostHeap {
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe {
+                let slot = (*data as *mut u32).add(index as usize);
+                slot.write_volatile(stride.unwrap_or(0));
+                slot.add(victory_shader::emit::SLOT_STRIDES_COUNT as usize)
+                    .write_volatile(view.and_then(texture_extent_word).unwrap_or(0));
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -2220,6 +2255,24 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn texture_metadata_uses_resource_dimensions_and_view_mip() {
+        let mut resource = [0; 14];
+        resource[0] = 3;
+        resource[4] = 12347;
+        resource[6] = 9123;
+        let mut srv = [0; 16];
+        srv[1] = 4; // Texture2D SRV
+        srv[4] = 3;
+        assert_eq!(texture_extent_word(&View::Placed(false, resource, srv)),
+                   Some(12346 | (9122 << 14) | (3 << 28)));
+        srv[1] = 6; // multisampled views have no first mip
+        assert_eq!(texture_extent_word(&View::Placed(false, resource, srv)),
+                   Some(12346 | (9122 << 14)));
+        resource[0] = 1;
+        assert_eq!(texture_extent_word(&View::Placed(false, resource, srv)), None);
+    }
+
     #[test]
     fn first_touch_uses_only_the_backed_part_of_a_table_view() {
         let mut resource = [0; 14];

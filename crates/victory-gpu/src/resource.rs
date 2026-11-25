@@ -1734,6 +1734,14 @@ fn host_texture(
     texture
 }
 
+/// The resource dimensions used by a texture SRV, before its mip offset.
+#[cfg(windows)]
+pub(crate) fn texture_extent(this: This) -> Option<(u64, u32)> {
+    if this.is_null() { return None; }
+    let desc = &resource(this).desc;
+    (desc.dimension != BUFFER).then_some((desc.width, desc.height))
+}
+
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
