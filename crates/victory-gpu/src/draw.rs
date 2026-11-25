@@ -2273,6 +2273,7 @@ impl State {
     /// memory and report both the requested view and the actual host resource.
     /// Each comma-separated VICTORY_TRACE_TEXTURE_RECORDS entry specifies
     /// shader:table-slot:table-dword:constant-slot:constant-dword:word-count.
+    /// Use slot+entry for constant-slot to read the offset from a table CBV.
     #[cfg(feature = "diagnostics")]
     fn trace_texture_record(&self, stage: &crate::pipeline::host::Stage, compute: bool) {
         struct Record {
@@ -2280,6 +2281,7 @@ impl State {
             table: u8,
             entry: u32,
             constant: u8,
+            cbv_entry: Option<u32>,
             dword: usize,
             words: usize,
         }
@@ -2290,11 +2292,16 @@ impl State {
                 .split(',')
                 .filter_map(|spec| {
                     let mut fields = spec.trim().split(':');
+                    let shader = fields.next()?.to_owned();
+                    let table = fields.next()?.parse().ok()?;
+                    let entry = fields.next()?.parse().ok()?;
+                    let source = fields.next()?;
+                    let (constant, cbv_entry) = match source.split_once('+') {
+                        Some((slot, entry)) => (slot.parse().ok()?, Some(entry.parse().ok()?)),
+                        None => (source.parse().ok()?, None),
+                    };
                     let record = Record {
-                        shader: fields.next()?.to_owned(),
-                        table: fields.next()?.parse().ok()?,
-                        entry: fields.next()?.parse().ok()?,
-                        constant: fields.next()?.parse().ok()?,
+                        shader, table, entry, constant, cbv_entry,
                         dword: fields.next()?.parse().ok()?,
                         words: fields.next()?.parse().ok()?,
                     };
@@ -2307,8 +2314,20 @@ impl State {
         if !crate::capture::listed(frame) || self.heaps[0] == 0 {
             return;
         }
-        let Some(Root::Constants(values)) = self.roots_ref(compute).get(usize::from(record.constant)) else { return };
-        let Some(&offset) = values.get(record.dword) else { return };
+        let offset = if let Some(entry) = record.cbv_entry {
+            let Some(View::Constant(address, size)) = self.table_view(compute, record.constant, entry) else { return };
+            if address == 0 || record.dword >= (size / 4) as usize { return }
+            let Some(word) = address.checked_add(record.dword as u64 * 4) else { return };
+            let mut bytes = [0; 4];
+            if !crate::host::read_into(word as *const u8, &mut bytes) { return }
+            let offset = u32::from_le_bytes(bytes);
+            tracing::info!(frame, shader = %record.shader, cbv = address, offset, "material record offset");
+            offset
+        } else {
+            let Some(Root::Constants(values)) = self.roots_ref(compute).get(usize::from(record.constant)) else { return };
+            let Some(&offset) = values.get(record.dword) else { return };
+            offset
+        };
         let Some(view) = self.table_view(compute, record.table, record.entry) else { return };
         let Some((base, bytes)) = crate::descriptor::host::backed_view_range(&view) else { return };
         let mut data = vec![0; record.words * 4];
