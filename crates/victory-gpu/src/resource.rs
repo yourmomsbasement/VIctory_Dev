@@ -2373,6 +2373,31 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_light_atlas_finds_its_gpu_writer_with_automatic_mips() {
+        let null = std::ptr::null();
+        let mut writer = null;
+        // The game stores packed lighting as R32_UINT, then samples the same
+        // memory as R9G9B9E5. Four pixels on a side allocate three mip levels.
+        let desc = ResourceDesc { flags: 4, ..texture(4, 4, 42, 0) };
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut writer),
+            S_OK
+        );
+        let address = resource(writer).data() as u64;
+        for (mips, expected) in [(3, Some(writer)), (2, None)] {
+            let placed = [3, 0, 0, 0, 4, 0, 4, (mips << 16) | 1, 67, 1, 0, 0, 0, 0];
+            let view = texture_at(address, &placed).expect("placed light atlas");
+            let source = alias_of(view);
+            // End the test's cached view before its backing allocation goes away.
+            PLACED_TEXTURES.lock().unwrap().remove(&(address, placed));
+            assert_eq!(slot::<Release>(view, 0x10)(view), 0);
+            assert_eq!(source, expected);
+        }
+        assert_eq!(slot::<Release>(writer, 0x10)(writer), 0);
+    }
+
     #[test]
     fn heaps_are_zeroed_aligned_memory() {
         let heap = heap(1 << 20);
