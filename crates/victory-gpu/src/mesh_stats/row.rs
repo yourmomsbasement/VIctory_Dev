@@ -74,7 +74,7 @@ pub(super) struct Probe {
 }
 
 impl Probe {
-    pub(super) fn new(resource: usize, dest: &ID3D12Resource, slot: u32, compute_x: Option<u32>) -> Option<Self> {
+    pub(super) fn new(resource: usize, dest: &ID3D12Resource, slot: u32, compute_x: Option<[u32; 2]>) -> Option<Self> {
         let row = selected()?;
         let source = crate::resource::host_copy(resource as crate::object::This)?;
         // SAFETY: the host texture is held for both copies.
@@ -89,7 +89,7 @@ impl Probe {
             return None;
         }
         let format = match (compute_x, desc.Format) {
-            (Some(x), DXGI_FORMAT_R8_UNORM) if x < row.width => DXGI_FORMAT_R8_UNORM,
+            (Some([first, last]), DXGI_FORMAT_R8_UNORM) if first <= last && last < row.width => DXGI_FORMAT_R8_UNORM,
             (None, DXGI_FORMAT_R8G8B8A8_TYPELESS | DXGI_FORMAT_R8G8B8A8_UNORM) => {
                 DXGI_FORMAT_R8G8B8A8_UNORM
             }
@@ -156,11 +156,19 @@ impl Probe {
 }
 
 /// The slot must have both copies completed in this mapped page.
-pub(super) unsafe fn mask_pixel(data: *const u8, slot: usize, x: u32) -> String {
+pub(super) unsafe fn mask_pixels(data: *const u8, slot: usize, [first, last]: [u32; 2]) -> String {
     let row = selected().expect("the captured mask has a configured row");
-    let offset = START as usize + slot * 2 * row.stride as usize + x as usize;
-    // SAFETY: Probe::new checked x against the width of this single-channel row.
-    unsafe { format!("{} {}", *data.add(offset), *data.add(offset + row.stride as usize)) }
+    let offset = START as usize + slot * 2 * row.stride as usize + first as usize;
+    let length = (last - first + 1) as usize;
+    // SAFETY: Probe::new checked both ends against the single-channel row.
+    let [before, after] = [offset, offset + row.stride as usize].map(|at| unsafe {
+        std::slice::from_raw_parts(data.add(at), length)
+    });
+    if length == 1 {
+        return format!("{} {}", before[0], after[0]);
+    }
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+    format!("{first}-{last} {} {}", hex(before), hex(after))
 }
 
 /// The slot must have both RGBA row copies completed in this mapped page.

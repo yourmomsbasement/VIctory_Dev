@@ -9,8 +9,10 @@
 //! as well as its dispatches on listed frames. Some lighting jobs run only at load.
 //! VICTORY_COMPUTE_MASK=slot+dword@x also reads one R8_UNORM texel at x
 //! on the configured material row before and after those dispatches.
+//! With `@first-last` that column holds the two inclusive R8 spans as hex.
 //! VICTORY_DEPTH_HISTORY=1280x720@352,364,310 records the two D32 depths
 //! at (352,310) and (364,310) around draws and depth clears on listed frames.
+//! Use `1280x5120/d16@x0,x1,y` to trace an unsigned 16-bit shadow atlas.
 
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
@@ -34,7 +36,7 @@ struct Draw {
     depth: usize,
     pipeline: String,
     sampled_row: bool,
-    mask_x: Option<u32>,
+    mask_x: Option<[u32; 2]>,
     input: Option<input::Snapshot>,
     dispatch: Option<input::Counts>,
 }
@@ -114,16 +116,18 @@ pub(crate) fn begin_clear(list: &HostList, resource: usize, description: impl Fn
 pub(crate) enum Command<'a> {
     Mesh(Option<Arguments<'a>>),
     Raster(Option<u64>),
-    Compute(Option<Arguments<'a>>, Option<(usize, u32)>),
+    Compute(Option<Arguments<'a>>, Option<(usize, [u32; 2])>),
 }
 
-pub(crate) fn compute_pixel() -> Option<(u8, u32, u32)> {
-    static SPEC: OnceLock<Option<(u8, u32, u32)>> = OnceLock::new();
+pub(crate) fn compute_pixels() -> Option<(u8, u32, [u32; 2])> {
+    static SPEC: OnceLock<Option<(u8, u32, [u32; 2])>> = OnceLock::new();
     *SPEC.get_or_init(|| {
         let s = std::env::var("VICTORY_COMPUTE_MASK").ok()?;
         let (view, x) = s.split_once('@')?;
         let (slot, dword) = view.split_once('+')?;
-        Some((slot.parse().ok()?, dword.parse().ok()?, x.parse().ok()?))
+        let (first, last) = x.split_once('-').unwrap_or((x, x));
+        let range = [first.parse().ok()?, last.parse().ok()?];
+        (range[0] <= range[1]).then_some((slot.parse().ok()?, dword.parse().ok()?, range))
     })
 }
 
@@ -345,7 +349,7 @@ impl Queries {
                         d.input.as_ref().map_or_else(|| "-".into(), input::Snapshot::words),
                         d.dispatch.as_ref().map_or_else(|| "-".into(), input::Counts::words),
                         s.CSInvocations,
-                        d.mask_x.map_or_else(|| "-".into(), |x| row::mask_pixel(data.cast(), i, x)),
+                        d.mask_x.map_or_else(|| "-".into(), |x| row::mask_pixels(data.cast(), i, x)),
                     );
                 }
                 p.buffer.Unmap(0, None);

@@ -1,6 +1,6 @@
 //! Before/after depth at two texels on the same row. Only the full depth plane
 //! can be copied from a DSV. Reuse one device-local staging buffer per list and
-//! retain only the two floats per snapshot for readback after the fence.
+//! retain only the two sampled depths per snapshot for readback after the fence.
 use crate::host::{HostList, host, transition};
 use crate::resource::HostTexture;
 use std::io::Write;
@@ -13,6 +13,7 @@ struct Spec {
     height: u32,
     x: [u32; 2],
     y: u32,
+    d16: bool,
 }
 
 fn spec() -> Option<&'static Spec> {
@@ -20,6 +21,8 @@ fn spec() -> Option<&'static Spec> {
     SPEC.get_or_init(|| {
         let s = std::env::var("VICTORY_DEPTH_HISTORY").ok()?;
         let (size, coords) = s.split_once('@')?;
+        let d16 = size.ends_with("/d16");
+        let size = size.strip_suffix("/d16").unwrap_or(size);
         let (width, height) = size.split_once('x')?;
         let mut coords = coords.split(',');
         let spec = Spec {
@@ -27,6 +30,7 @@ fn spec() -> Option<&'static Spec> {
             height: height.parse().ok()?,
             x: [coords.next()?.parse().ok()?, coords.next()?.parse().ok()?],
             y: coords.next()?.parse().ok()?,
+            d16,
         };
         (coords.next().is_none() && spec.y < spec.height && spec.x.iter().all(|x| *x < spec.width))
             .then_some(spec)
@@ -45,8 +49,13 @@ pub(super) fn source(resource: usize) -> Option<Arc<HostTexture>> {
         && d.MipLevels == 1
         && d.DepthOrArraySize == 1
         && d.SampleDesc.Count == 1
-        && d.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
-        .then_some(copy)
+        && d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        && if s.d16 {
+            matches!(d.Format, DXGI_FORMAT_R16_TYPELESS | DXGI_FORMAT_D16_UNORM)
+        } else {
+            d.Format == DXGI_FORMAT_R32G8X24_TYPELESS
+        })
+    .then_some(copy)
 }
 
 #[derive(Clone)]
@@ -54,6 +63,7 @@ struct Stage {
     buffer: ID3D12Resource,
     layout: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     at: [u64; 2],
+    sample_bytes: u64,
 }
 
 impl Stage {
@@ -76,7 +86,12 @@ impl Stage {
             )
         };
         let stride = row_bytes.checked_div(u64::from(s.width))?;
-        if !matches!(stride, 4 | 8) || row_bytes != stride * u64::from(s.width) {
+        let valid_stride = if s.d16 {
+            stride == 2
+        } else {
+            matches!(stride, 4 | 8)
+        };
+        if !valid_stride || row_bytes != stride * u64::from(s.width) {
             return None;
         }
         let row = layout.Offset + u64::from(s.y) * u64::from(layout.Footprint.RowPitch);
@@ -85,6 +100,7 @@ impl Stage {
             buffer: host.uav_buffer(size)?,
             layout,
             at,
+            sample_bytes: if s.d16 { 2 } else { 4 },
         })
     }
 }
@@ -154,7 +170,7 @@ impl Probe {
                     self.at + u64::from(after) * 8 + i as u64 * 4,
                     &self.stage.buffer,
                     *offset,
-                    4,
+                    self.stage.sample_bytes,
                 );
             }
             list.list
@@ -238,7 +254,15 @@ impl History {
                     continue;
                 }
                 for (i, e) in entries.iter().enumerate() {
-                    let [a, b, c, d] = *p.cast::<[f32; 4]>().add(i);
+                    let slot = p.cast::<u8>().add(i * ENTRY_BYTES as usize);
+                    let [a, b, c, d] = std::array::from_fn(|k| {
+                        let sample = slot.add(k * 4);
+                        if s.d16 {
+                            f32::from(sample.cast::<u16>().read()) / 65535.0
+                        } else {
+                            sample.cast::<f32>().read()
+                        }
+                    });
                     let _ = writeln!(
                         out,
                         "{}\t{:#x}\t{}\t{:#x}\t{}\t{}\t{}\t{a}\t{b}\t{c}\t{d}",

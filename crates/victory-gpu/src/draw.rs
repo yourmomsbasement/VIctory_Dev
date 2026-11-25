@@ -1877,7 +1877,7 @@ impl State {
         &self, list: &HostList, p: &HostPipeline, arguments: Option<crate::mesh_stats::Arguments<'_>>,
     ) -> Option<crate::mesh_stats::Active> {
         traced_compute_shader(p)?;
-        let output = crate::mesh_stats::compute_pixel().and_then(|(slot, dword, x)| {
+        let output = crate::mesh_stats::compute_pixels().and_then(|(slot, dword, x)| {
             let used = p.stages.iter().any(|s| s.translated().used.iter().any(|u| {
                 u.root == RootType::Table && u.kind == ResourceType::Uav
                     && u.slot == slot && u.table_offset_dwords == dword
