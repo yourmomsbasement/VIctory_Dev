@@ -776,7 +776,7 @@ pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
 ];
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -847,34 +847,39 @@ mod tests {
         assert_eq!(dpp_lane(swap, 8), Some((9, false, true)));
     }
 
+    pub(in crate::emit) fn double_count_words(low: u32, high: u32, repeat: bool) -> Vec<u32> {
+        // Set v6:v7 to the selected double, then put +0 in unselected lanes.
+        let mut words = vec![vop1(6, 1, 255), low, vop1(7, 1, 255), high, sop1(4, 0x25, 193)];
+        words.extend(vop3(2, 0x101, 128, 262, 4));
+        words.extend(vop3(3, 0x101, 128, 263, 4));
+        // XOR neighbours within each row. Omitting a bit and repeating
+        // a previous one counts lanes twice while skipping others.
+        for bit in [1, if repeat { 1 } else { 2 }, 4, 8] {
+            for r in 2..=3 {
+                words.extend([vop1(r + 2, 1, 0xfa), dpp16(r, 0x160 + bit, 15, 15, true)]);
+            }
+            words.extend(vop3(2, 0x164, 260, 258, 0));
+        }
+        for r in 2..=3 {
+            words.extend(vop3(r + 2, 0x378, 256 + u16::from(r), 128, 128));
+        }
+        words.extend(vop3(2, 0x164, 260, 258, 0));
+        words.extend(vop3(16, 0x360, 258, 160, 0));
+        words.extend(vop3(17, 0x360, 259, 160, 0));
+        words.extend(vop3(2, 0x164, 16, 258, 0));
+        words.extend(vop3(17, 0x360, 259, 128, 0));
+        words.extend([sop1(18, 3, 17), sop1(EXEC, 4, 4)]);
+        words
+    }
+
     #[test]
     fn double_lane_count_requires_zero_or_one_and_distinct_lanes() {
         let shape = |low: u32, high: u32, repeat: bool| {
-            // Set v6:v7 to the selected double, then put +0 in unselected lanes.
-            let mut words = vec![vop1(6, 1, 255), low, vop1(7, 1, 255), high, sop1(4, 0x25, 193)];
-            words.extend(vop3(2, 0x101, 128, 262, 4));
-            words.extend(vop3(3, 0x101, 128, 263, 4));
-            // XOR neighbours within each row. Omitting a bit and repeating
-            // a previous one counts lanes twice while skipping others.
-            for bit in [1, if repeat { 1 } else { 2 }, 4, 8] {
-                for r in 2..=3 {
-                    words.extend([vop1(r + 2, 1, 0xfa), dpp16(r, 0x160 + bit, 15, 15, true)]);
-                }
-                words.extend(vop3(2, 0x164, 260, 258, 0));
-            }
-            for r in 2..=3 {
-                words.extend(vop3(r + 2, 0x378, 256 + u16::from(r), 128, 128));
-            }
-            words.extend(vop3(2, 0x164, 260, 258, 0));
-            words.extend(vop3(8, 0x360, 258, 160, 0));
-            words.extend(vop3(9, 0x360, 259, 160, 0));
-            words.extend(vop3(2, 0x164, 8, 258, 0));
-            words.extend(vop3(9, 0x360, 259, 128, 0));
-            words.extend([sop1(10, 3, 9), sop1(EXEC, 4, 4)]);
+            let words = double_count_words(low, high, repeat);
             let p = build(&words, true);
             let insts = &p.blocks[0].insts;
             let saved = insts[2].write(Reg::S(4)).unwrap();
-            let high = insts[insts.len() - 3].write(Reg::S(10)).unwrap();
+            let high = insts[insts.len() - 3].write(Reg::S(18)).unwrap();
             (sections(&p, 0)[&2].shapes.get(&high).copied(), Shape::DoubleCountHigh(saved))
         };
         let (actual, expected) = shape(0, 0x3ff0_0000, false);

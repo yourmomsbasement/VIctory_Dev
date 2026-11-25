@@ -370,6 +370,30 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
 }
 
 #[test]
+fn masked_double_counts_match_the_reference_across_host_waves() {
+    let mut words = vec![
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    ];
+    words.extend(super::wave::tests::double_count_words(0, 0x3ff0_0000, false));
+    words.extend([
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E00_0212, // v_mov_b32 v0, s18 (high dword of the double)
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    let native = native(&words);
+    let ir = ir::build(&native.code, true, native.vgprs).unwrap();
+    let shader = lowered(&native, &ir, &HashSet::new()).unwrap();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for count in [0, 1, 17, 32, 33, 63, 64] {
+        let Some(high) = on_the_card(&shader, [count, 0]) else { return };
+        assert_eq!(high, (f64::from(count).to_bits() >> 32) as u32, "{count} lanes");
+    }
+    eprintln!("ran the masked double counts on the hardware device");
+}
+
+#[test]
 fn lane_permutations_obey_rows_selectors_and_inactive_sources() {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for (opcode, control, cases) in [
