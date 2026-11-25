@@ -1444,6 +1444,15 @@ pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
     }
 }
 
+/// Bytes that an address-taking shader can access within both the table
+/// view and its underlying resource. A view may extend beyond its buffer.
+pub(crate) fn backed_view_range(view: &View) -> Option<(u64, u64)> {
+    let (address, len) = buffer_range(view)?;
+    let (base, size) = buffer_extent(view)?;
+    let bytes = len.min(size.checked_sub(address.checked_sub(base)?)?);
+    (address != 0 && bytes != 0).then_some((address, bytes))
+}
+
 /// Whether a buffer view is brought up to date in the host copy its slot
 /// shows ([`buffer_copy`]). On by default; `VICTORY_VIEW_EXTENT=0` looks the
 /// copy up by the view's range alone, as before.
@@ -2211,6 +2220,23 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_touch_uses_only_the_backed_part_of_a_table_view() {
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        resource[4] = 128;
+        let mut desc = [0; 16];
+        desc[1] = 1; // buffer SRV
+        desc[4] = 8; // first element
+        desc[6] = 32; // count
+        desc[7] = 4; // stride
+        desc[11] = 2; // base is 8 GiB
+        let view = super::View::Placed(false, resource, desc);
+        assert_eq!(super::backed_view_range(&view), Some(((2 << 32) + 32, 96)));
+        desc[4] = 32;
+        assert_eq!(super::backed_view_range(&super::View::Placed(false, resource, desc)), None);
+    }
+
     use super::*;
 
     /// A null texture UAV keeps the title's dimension (3D for the world's

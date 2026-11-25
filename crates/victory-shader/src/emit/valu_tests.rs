@@ -97,6 +97,45 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     build_cs(body, 1, 0)
 }
 
+#[test]
+fn a_vector_load_resolves_each_title_page_and_reports_the_missing_half() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // global_load_dwordx3 v[4:6], v[1:2], null
+    let mut body = vec![0xdc3c_8000, 0x047d_0001];
+    body.extend(buffer_store_dword(5, 8, 4));
+    body.extend(buffer_store_dword(6, 8, 8));
+    body.push(vop1(1, 0, vgpr(4)));
+    let shader = build_valu_cs(&body);
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        constants[u.index as usize] = match (u.root, u.dword) {
+            (RootType::Constants, 0) => 0x1fff8,
+            (RootType::Other(super::USER_MEMORY_BASE), _) => 1,
+            _ => 0,
+        };
+    }
+    let page = 65536 / 4;
+    let mut first = vec![0xdead_beef; page + 1];
+    first[page - 2..page].copy_from_slice(&[11, 22]);
+    for warp in [true, false] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("page load pipeline");
+        for mapped in [true, false] {
+            let directory = vec![0, 0, 1, 0, if mapped { 2 } else { 0 }, 0];
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(constants.clone())), (1, Root::Uav(4)),
+                    (2, Root::View { srv: true, data: directory })],
+                views: &[View::RawUav(3), View::RawUav(4), View::RawUavData(&first),
+                    View::RawUavData(&[33]), View::RawUav(super::MEMORY_FAULTS)],
+                samplers: &[], groups: [1, 1, 1],
+            }).expect("page load");
+            assert_eq!(out[0], [11, 22, if mapped { 33 } else { 0 }]);
+            assert_eq!(out[4][0], u32::from(!mapped));
+            assert_eq!(out[4][super::MEMORY_FAULT_SUMMARY as usize], if mapped { 0 } else { 4 });
+        }
+    }
+}
+
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {

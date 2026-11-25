@@ -719,12 +719,9 @@ impl State {
             return 0;
         }
         // The title address of the buffer view at that dword of the table.
-        let address = match self.roots_ref(compute).get(usize::from(slot)) {
-            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
-            _ => 0,
-        };
+        let address = self.table_view(compute, slot, dword)
+            .and_then(|view| crate::descriptor::host::buffer_range(&view))
+            .map_or(0, |range| range.0);
         if address == 0 {
             once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
         }
@@ -735,23 +732,41 @@ impl State {
         }
     }
 
+    fn table_view(&self, compute: bool, slot: u8, dword: u32) -> Option<crate::descriptor::View> {
+        let &Root::Table(table) = self.roots_ref(compute).get(usize::from(slot))? else { return None };
+        let handle = table.checked_add(u64::from(dword) * 4)?;
+        crate::descriptor::view(handle)
+    }
+
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(
+        &self, list: &HostList, compute: bool, writes: bool, user_data: &[victory_shader::emit::UserData],
+    ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+        let (mut addresses, mut constants, mut table_ranges) = (Vec::new(), Vec::new(), Vec::new());
+        // These are the exact table-view addresses supplied to this shader.
+        // Register them before the dispatch that first follows them.
+        for word in user_data {
+            if word.root == RootType::Other(victory_shader::emit::USER_VIEW_ADDRESS)
+                && let Some(view) = self.table_view(compute, word.slot, word.dword)
+                && let Some((address, len)) = crate::descriptor::host::backed_view_range(&view)
+            {
+                table_ranges.push((address, len));
+            }
+        }
         for root in self.roots_ref(compute) {
             match root {
                 Root::View(address) => addresses.push(*address),
-                Root::Constants(values) => constants.extend_from_slice(values),
+                Root::Constants(values) => constants.push(values.as_slice()),
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        crate::memory::ready(list, heap, &addresses, &constants, &table_ranges, writes)
     }
 
     /// The bound heap holding `handle`.
@@ -929,7 +944,7 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, compute, writes, &t.host.user_data) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1656,7 +1671,9 @@ impl State {
         crate::capture::op(0, || {
             use std::fmt::Write;
             let [x, y, z] = groups;
-            let mut text = format!("  its roots ({x}x{y}x{z}):");
+            // The first-bind log identifies the shader by this handle even
+            // when the host never builds its pipeline.
+            let mut text = format!("  its roots ({x}x{y}x{z}) pipeline {:#x}:", self.pipeline);
             for (slot, root) in self.compute.iter().enumerate() {
                 match root {
                     Root::None => {}

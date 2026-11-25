@@ -19,7 +19,8 @@
 //! - the **faults**: the page numbers shaders found empty, read back here
 //!   once a frame, so the copies exist from the next frame on. A pointer a
 //!   shader takes out of memory cannot be known before it runs; the
-//!   addresses a dispatch is given as root views are made ready before it.
+//!   addresses a dispatch is given as root views and table-view addresses
+//!   are made ready before it.
 //!
 //! **A page that is not there when a shader touches it is a lost access**:
 //! the read gives 0, the store is dropped, and the fault note only helps
@@ -48,7 +49,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_FAULT_SUMMARY, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -67,6 +68,7 @@ struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
+    seen_faults: Vec<u32>,
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
     /// Per host view heap (by address): the first slot of its run, and how
@@ -108,6 +110,7 @@ impl Memory {
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+            seen_faults: vec![0; (MEMORY_FAULTS - MEMORY_FAULT_SUMMARY) as usize],
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
@@ -127,6 +130,16 @@ impl Memory {
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
         if unsafe { entry.read() } != 0 {
+            return;
+        }
+        // Each registered copy published every whole page it covers. An
+        // empty entry now needs a new copy; avoid allocating its backing
+        // storage when there is no descriptor available for it.
+        if self.copies.len() == COPIES as usize {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros");
+            });
             return;
         }
         let start = page * PAGE;
@@ -155,7 +168,7 @@ impl Memory {
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
+            None => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
@@ -178,13 +191,6 @@ impl Memory {
                 }
                 n
             }
-            None => {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
-                });
-                return;
-            }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
         // The offset first: a shader that sees the number sees it too.
@@ -195,34 +201,39 @@ impl Memory {
         }
     }
 
-    /// The pages shaders found empty since the last frame.
+    /// GPU writers only set bits. If a submission is still writing while we
+    /// scan, its additions remain visible on the next scan. Previously seen
+    /// pages that are still missing get another mapping attempt in rotation.
     fn take_faults(&mut self) {
-        let mut pages = Vec::new();
-        for i in 1..MEMORY_FAULTS as usize {
-            // SAFETY: inside the faults' mapping; the GPU may be writing,
-            // a number missed now is written again next frame.
-            let at = unsafe { self.faults.1.add(i) };
-            // SAFETY: as above.
-            let page = unsafe { at.read_volatile() };
-            if page != 0 {
-                pages.push(page);
-                // SAFETY: as above.
-                unsafe { at.write_volatile(0) };
+        let faults = self.faults.1;
+        let directory = self.directory.1;
+        let mut pages = fault_pages(&mut self.seen_faults, self.frame, |index| {
+            // SAFETY: the two bitmap levels occupy MEMORY_FAULTS mapped dwords.
+            unsafe { faults.add(index).read_volatile() }
+        });
+        pages.retain(|&p| {
+            // SAFETY: one directory entry per bitmap bit. A root argument
+            // or an earlier fault may already have mapped the whole copy.
+            unsafe { directory.add(p as usize * 2).read() == 0 }
+        });
+        if let Some(&first) = pages.first() {
+            for &page in &pages {
+                self.map(u64::from(page) * PAGE);
             }
-        }
-        if !pages.is_empty() {
-            // Each is an access that read 0 or was dropped.
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                let mapped = pages.iter().filter(|&&p| {
+                    // SAFETY: the same bounded entries inspected above.
+                    unsafe { directory.add(p as usize * 2).read() != 0 }
+                }).count();
                 tracing::warn!(
                     pages = pages.len(),
-                    first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
-                    "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now"
+                    mapped,
+                    copies = self.copies.len(),
+                    first = format_args!("{:#x}", u64::from(first) * PAGE),
+                    "title memory by address: shaders requested missing pages"
                 );
             }
-        }
-        for page in pages {
-            self.map(u64::from(page) * PAGE);
         }
     }
 
@@ -232,6 +243,44 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
     }
+
+    /// A shader takes the address of a known table view. Register copies
+    /// up to its end, stopping at the first page without usable backing.
+    fn name_view(&mut self, address: u64, len: u64) {
+        let limit = (u64::from(MEMORY_PAGES) - 1) * PAGE;
+        let end = address.saturating_add(len).min(limit);
+        let mut at = address;
+        while at < end {
+            self.map(at);
+            // SAFETY: at is below the directory limit.
+            let copy = unsafe { self.directory.1.add((at / PAGE) as usize * 2).read() };
+            if copy == 0 { break }
+            let (base, bytes) = self.copies[copy as usize - 1].span();
+            // map published all whole pages in this copy.
+            at = (base + bytes) & !(PAGE - 1);
+        }
+    }
+}
+
+fn fault_pages(seen: &mut [u32], frame: u64, read: impl Fn(usize) -> u32) -> Vec<u32> {
+    let summary_words = seen.len().div_ceil(32);
+    let mut pages = Vec::new();
+    for index in 0..summary_words {
+        let mut summary = read(index);
+        while summary != 0 {
+            let word = index * 32 + summary.trailing_zeros() as usize;
+            summary &= summary - 1;
+            let Some(previous) = seen.get_mut(word) else { continue };
+            let bits = read(summary_words + word);
+            let mut pending = if word as u64 % 64 == frame % 64 { bits } else { bits & !*previous };
+            *previous |= bits;
+            while pending != 0 {
+                pages.push(word as u32 * 32 + pending.trailing_zeros());
+                pending &= pending - 1;
+            }
+        }
+    }
+    pages
 }
 
 /// Numbered copies this command list has already scheduled for refresh or
@@ -256,8 +305,8 @@ impl Coverage {
 }
 
 /// Before a draw whose shader reads title memory by address: what its
-/// root arguments name gets its copies (`addresses`: its root views;
-/// `constants`: its root constants, see the module), every numbered copy
+/// root arguments name gets its copies (root views, table-view ranges
+/// and each block of root constants, see the module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted (and, with `writes`, copied back after). None if the host
 /// cannot hold it; the draw is then dropped.
@@ -265,7 +314,8 @@ pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
     addresses: &[u64],
-    constants: &[u32],
+    constant_blocks: &[&[u32]],
+    table_ranges: &[(u64, u64)],
     writes: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -282,18 +332,22 @@ pub(crate) fn ready(
     for &address in addresses {
         m.name(address);
     }
+    for &(address, len) in table_ranges {
+        m.name_view(address, len);
+    }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
     // memory nothing reads; one that is not the title's memory is refused.
-    for (i, &c) in constants.iter().enumerate() {
-        if let Some(&high) = constants.get(i + 1)
-            && (1..=0xFF).contains(&high)
-            && c >= 0x1_0000
-        {
-            m.name(u64::from(c) | u64::from(high) << 32);
-        }
-        if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+    for &constants in constant_blocks {
+        for (i, &c) in constants.iter().enumerate() {
+            if let Some(&high) = constants.get(i + 1)
+                && (1..=0xFF).contains(&high) && c >= 0x1_0000
+            {
+                m.name(u64::from(c) | u64::from(high) << 32);
+            }
+            if c >= 0x0100_0000 {
+                m.name(u64::from(c) << 8);
+            }
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -334,7 +388,23 @@ pub(crate) fn ready(
 
 #[cfg(test)]
 mod tests {
-    use super::Coverage;
+    use super::{Coverage, fault_pages};
+
+    #[test]
+    fn faults_survive_late_gpu_writes_and_unresolved_pages_are_retried() {
+        let mut seen = [0; 64];
+        let mut bits = [0u32; 66];
+        bits[0] = 1 << 3;
+        bits[2 + 3] = 1 << 7;
+        assert_eq!(fault_pages(&mut seen, 0, |w| bits[w]), [103]);
+        bits[2 + 3] |= 1 << 9;
+        // Leaf for word 33 is already visible, but its summary bit is late.
+        bits[2 + 33] = 1 << 31;
+        assert_eq!(fault_pages(&mut seen, 1, |w| bits[w]), [105]);
+        bits[1] = 1 << 1;
+        assert_eq!(fault_pages(&mut seen, 2, |w| bits[w]), [1087]);
+        assert_eq!(fault_pages(&mut seen, 3, |w| bits[w]), [103, 105]);
+    }
 
     #[test]
     fn interleaved_lists_cover_new_copies_and_promote_reads_to_writes() {

@@ -2738,7 +2738,7 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        use super::shader::{MEMORY_FAULT_SUMMARY, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2767,31 +2767,31 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        // A page without a copy: its number, at a place by the number, or
-        // at the sink for lanes that do not run and pages that have one.
+        // Record only active accesses to a missing, mappable page. GPU
+        // writers only set bits, including when they share a bitmap word.
         let zero = k(self, 0);
-        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+        let unmapped = self.s.m.cmp(c, pred::EQ, copy, zero);
+        let mappable = self.s.m.cmp(c, pred::IULT, page, last);
+        let mut missing = self.s.m.bin(c, Bin::And, unmapped, mappable);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
-        let places = k(self, MEMORY_FAULTS - 1);
-        let place = self.s.m.bin(c, Bin::URem, page, places);
-        let one = k(self, 1);
-        let place = self.s.m.bin(c, Bin::Add, place, one);
-        let k2 = k(self, 2);
-        let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        let gate = self.begin_guarded(Some(missing));
+        let at = self.cur;
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
-        let void = self.s.t.void;
-        let mask = self.s.m.i8(1);
-        self.s.op(
-            c,
-            "rawBufferStore.i32",
-            Attr::NoUnwind,
-            void,
-            140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
-        );
+        let (five, two, one, mask) = (k(self, 5), k(self, 2), k(self, 1), k(self, 31));
+        let word = self.s.m.bin(at, Bin::LShr, page, five);
+        let summary = self.s.m.bin(at, Bin::LShr, word, five);
+        let prefix = k(self, MEMORY_FAULT_SUMMARY);
+        let leaf = self.s.m.bin(at, Bin::Add, word, prefix);
+        for (index, bit) in [(leaf, page), (summary, word)] {
+            let byte = self.s.m.bin(at, Bin::Shl, index, two);
+            let bit = self.s.m.bin(at, Bin::And, bit, mask);
+            let bits = self.s.m.bin(at, Bin::Shl, one, bit);
+            self.s.op(at, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, two, byte, iu, iu, bits]);
+        }
+        self.end_guarded(gate, &[]);
+        let c = self.cur;
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
@@ -2799,6 +2799,65 @@ impl<'a> Lower<'a> {
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
         (h, byte)
+    }
+
+    /// One raw memory operation entirely within a single directory page.
+    /// Stores have already been guarded by the caller.
+    fn memory_chunk(&mut self, lo: V, hi: V, guard: Option<V>, count: u8, store: Option<&[V]>) -> Vec<V> {
+        let (handle, byte) = self.memory(lo, hi, guard);
+        let c = self.cur;
+        let undef = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8((1u8 << count) - 1);
+        let align = self.s.m.i32(4);
+        if let Some(words) = store {
+            let mut values = [undef; 4];
+            values[..words.len()].copy_from_slice(words);
+            let [a, b, d, e] = values;
+            self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, self.s.t.void, 140,
+                &[handle, byte, undef, a, b, d, e, mask, align]);
+            Vec::new()
+        } else {
+            let result = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139,
+                &[handle, byte, undef, mask, align]);
+            (0..count).map(|k| {
+                let value = self.s.m.extract(c, result, u32::from(k));
+                self.as_int(value)
+            }).collect()
+        }
+    }
+
+    /// Neighbouring title pages can have different copies, or one can be
+    /// absent. Keep the vector operation for the usual single-page case.
+    fn memory_words(&mut self, lo: V, hi: V, guard: Option<V>, count: u8, store: Option<&[V]>) -> Vec<V> {
+        if count == 1 {
+            return self.memory_chunk(lo, hi, guard, count, store);
+        }
+        let mask = self.s.m.i32(0xffff);
+        let last = self.s.m.i32(0x10000 - u32::from(count) * 4);
+        let offset = self.s.m.bin(self.cur, Bin::And, lo, mask);
+        let crosses = self.s.m.cmp(self.cur, pred::IUGT, offset, last);
+        let split = self.s.m.new_block();
+        let whole = self.s.m.new_block();
+        let join = self.s.m.new_block();
+        self.s.m.terminate(self.cur, Term::CondBr(crosses, split, whole));
+        self.cur = whole;
+        let vector = self.memory_chunk(lo, hi, guard, count, store);
+        let whole_end = self.cur;
+        self.s.m.terminate(whole_end, Term::Br(join));
+        self.cur = split;
+        let mut scalar = Vec::new();
+        for k in 0..usize::from(count) {
+            let (low, high) = self.address_plus(lo, hi, 4 * k as i32);
+            scalar.extend(self.memory_chunk(low, high, guard, 1, store.map(|words| &words[k..=k])));
+        }
+        let split_end = self.cur;
+        self.s.m.terminate(split_end, Term::Br(join));
+        self.cur = join;
+        vector.into_iter().zip(scalar).map(|(a, b)| {
+            let result = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(result, vec![(a, whole_end), (b, split_end)]);
+            result
+        }).collect()
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -2830,8 +2889,7 @@ impl<'a> Lower<'a> {
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
-        let c = self.cur;
-        let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let iu = self.s.m.undef(i32t);
         let align = self.s.m.i32(4);
         let name = inst.name();
@@ -2847,20 +2905,8 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard);
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
-            for k in 0..n {
-                let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
-                self.write(inst, Reg::V(reg + k), x, guard);
+            for (k, x) in self.memory_words(lo, hi, guard, n, None).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }
@@ -2868,15 +2914,8 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
-            let mut args = vec![h, byte, iu];
-            args.extend(&vals);
-            args.resize(3 + 4, iu);
-            args.push(self.s.m.i8((1u8 << n) - 1));
-            args.push(align);
             let at = self.begin_guarded(guard);
-            self.s
-                .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            self.memory_words(lo, hi, None, n, Some(&vals));
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -2896,6 +2935,7 @@ impl<'a> Lower<'a> {
             None => self.s.m.i32(0),
         };
         let (h, byte) = self.memory(lo, hi, guard);
+        let c = self.cur;
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -3015,7 +3055,7 @@ impl<'a> Lower<'a> {
         };
         let (mut lo, mut hi) = (word(self, 0)?, word(self, 1)?);
         let c = self.cur;
-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let i32t = self.s.t.i32;
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             // An offset register counts up from the address.
             let so = self.operand(inst, &soffset)?;
@@ -3025,24 +3065,11 @@ impl<'a> Lower<'a> {
             hi = self.s.m.bin(c, Bin::Add, hi, carry);
             lo = sum;
         }
-        let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None);
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
-            for k in 0..n {
-                let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + first + k), x, None);
+            for (k, x) in self.memory_words(lo, hi, None, n, None).into_iter().enumerate() {
+                self.write(inst, Reg::S(code + first + k as u8), x, None);
             }
         }
         Ok(())

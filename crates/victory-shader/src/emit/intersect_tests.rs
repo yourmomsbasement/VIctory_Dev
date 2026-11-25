@@ -11,8 +11,8 @@
 //! the node pointer or in the descriptor. These tests have no host that
 //! keeps copies of title memory and their directory, so for the second
 //! they put a stand-in under the node reader
-//! (`lower::intersect::TEST_MEMORY`); without it the same program reads
-//! through the directory, which is only checked to lower and validate.
+//! (`lower::intersect::TEST_MEMORY`). A separate dispatch binds the real
+//! directory and reads back its missing-page bitmap.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::intersect::TEST_MEMORY;
@@ -602,6 +602,136 @@ fn the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
 
 /// Where the tests' title memory puts the buffer: past 4 GiB, on 256 bytes.
 const BASE: u64 = 0x12_3456_7800;
+
+/// Look up a particular locally supplied builder stage by DXBC signature.
+fn builder_stage(signature: &[u8; 20]) -> HostShader {
+    let file = std::fs::read(std::env::var_os("VICTORY_TEST_BVH_BUILDER").expect("builder path")).unwrap();
+    let start = file.windows(signature.len()).position(|s| s == signature).expect("matching builder stage");
+    let size = u32::from_le_bytes(file[start + 24..start + 28].try_into().unwrap()) as usize;
+    super::translate(&file[start..start + size]).expect("translate builder stage")
+}
+
+#[test]
+#[ignore = "requires VICTORY_TEST_BVH_BUILDER pointing to the title's builder DLL"]
+fn the_builder_copies_a_multi_iteration_structure_on_the_card() {
+    let shader = builder_stage(b"DXBC\x39\xf4\x30\x25\xdb\xce\x19\x0e\x43\x67\xf0\x3d\x51\x5a\x6f\xc6");
+    assert!(shader.root_cbvs.is_empty() && shader.root_srvs.is_empty());
+    assert_eq!(shader.root_uavs, [0, 1]);
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        match (u.slot, u.root, u.dword) {
+            (2, RootType::Constants, 0) => constants[u.index as usize] = 32,
+            (2, RootType::Constants, _) => (),
+            (0 | 1, RootType::Other(super::USER_VIEW_BIAS), _) => (),
+            other => panic!("unexpected copy argument {other:?}"),
+        }
+    }
+    // A 64-byte header and fifteen 64-byte nodes. One group covers the
+    // first 512 bytes and then loops. Guard words follow the output.
+    let mut data: Vec<u32> = (0..256).map(|i| 0xabcd_0000 + i).collect();
+    data[1] = 15;
+    let mut want = data.clone();
+    want.extend_from_slice(&[0; 16]);
+    for warp in [true, false] {
+        let host = Host::new(warp).expect("adapter");
+        let (root, pso) = host.compute_pipeline(&shader).expect("copy pipeline");
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants.clone())), (1, Root::Uav(0)), (2, Root::Uav(1))],
+            views: &[View::RawUavData(&data), View::RawUav(want.len() as u32)],
+            samplers: &[], groups: [1, 1, 1],
+        }).expect("dispatch");
+        assert_eq!(out[0], data, "source");
+        assert_eq!(out[1], want, "destination");
+        eprintln!("verified the builder's structure copy on {}", if warp { "WARP" } else { "hardware" });
+    }
+}
+
+#[test]
+#[ignore = "requires VICTORY_TEST_BVH_BUILDER pointing to the title's builder DLL"]
+fn the_builder_initializes_bounds_across_separate_page_copies() {
+    let shader = builder_stage(b"DXBC\xb4\x0c\x42\x33\x3f\x8a\x98\x51\x5e\xd6\x8f\x49\xc1\xd7\x83\x97");
+    assert_eq!(shader.root_srvs, [super::SLOT_MEMORY]);
+    assert_eq!(shader.root_uavs, [super::SLOT_FAULTS]);
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    let bounds = [0x30020, 0, 0x1fff8, 0, (-2i32) as u32];
+    for u in &shader.user_data {
+        constants[u.index as usize] = match (u.slot, u.root) {
+            (2, RootType::Constants) => bounds.get(u.dword as usize).copied().unwrap_or(0),
+            (_, RootType::Other(super::USER_MEMORY_BASE)) => 0,
+            other => panic!("unexpected bounds argument {other:?}"),
+        };
+    }
+    let directory = vec![0, 0, 1, 0, 2, 0, 3, 0];
+    const PAGE: usize = 65536 / 4;
+    let sentinel = vec![0xcccc_cccc; PAGE + 4];
+    let mut expected = vec![sentinel.clone(); 3];
+    let values = [f32::MAX.to_bits(); 3].into_iter().chain([f32::MIN.to_bits(); 3]).collect::<Vec<_>>();
+    expected[0][PAGE-2..PAGE].copy_from_slice(&values[..2]);
+    expected[1][..4].copy_from_slice(&values[2..]);
+    expected[2][12..18].copy_from_slice(&values);
+    for warp in [true, false] {
+        let host = Host::new(warp).expect("adapter");
+        let (root, pso) = host.compute_pipeline(&shader).expect("bounds pipeline");
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants.clone())), (1, Root::Uav(4)),
+                (2, Root::View { srv: true, data: directory.clone() })],
+            views: &[View::RawUav(4), View::RawUavData(&sentinel), View::RawUavData(&sentinel),
+                View::RawUavData(&sentinel), View::RawUav(super::MEMORY_FAULTS)],
+            samplers: &[], groups: [1, 1, 1],
+        }).expect("dispatch");
+        for (page, (actual, want)) in out[1..4].iter().zip(&expected).enumerate() {
+            assert_eq!(actual.iter().zip(want).position(|(a,b)| a != b), None, "page {}", page + 1);
+        }
+        assert!(out[0].iter().chain(&out[4]).all(|&word| word == 0));
+        eprintln!("verified the builder's bounds on {}", if warp { "WARP" } else { "hardware" });
+    }
+}
+
+#[test]
+fn the_page_directory_records_all_active_missing_node_pages_on_the_card() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (shader, _) = build(true, WHOLE).unwrap();
+    let mut data = vec![0; (NODES / 4) as usize];
+    // 1 and 4096 used to share a reporting slot. Read the last node
+    // of page 31 as a 128-byte box so the second half must report 32.
+    for (lane, page) in [1u32, 2, 4096, 4097, 31, 1023, 1024, 3, 2049].into_iter().enumerate() {
+        let record = &mut data[lane * (RECORD / 4) as usize..];
+        let (offset, kind) = if page == 31 { (65536 - 64, 5) } else { (0, 4) };
+        record[0] = ((page * 65536 + offset) >> 3) | kind;
+        record[12] = u32::from(page != 2049);
+    }
+    let mut directory = vec![0; 4098 * 2];
+    directory[3 * 2] = 1;
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        if u.root == RootType::Other(super::USER_MEMORY_BASE) {
+            constants[u.index as usize] = 2;
+        }
+    }
+    let mut want = vec![0u32; super::MEMORY_FAULTS as usize];
+    for p in [1usize, 2, 31, 32, 1023, 1024, 4096, 4097] {
+        let word = p / 32;
+        want[super::MEMORY_FAULT_SUMMARY as usize + word] |= 1 << (p % 32);
+        want[word / 32] |= 1 << (word % 32);
+    }
+    for warp in [true, false] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("node pipeline");
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants.clone())), (1, Root::Uav(3)),
+                (2, Root::View { srv: true, data: directory.clone() })],
+            views: &[View::Buffer { data: &data, stride: Stride::Raw }, View::RawUav(4 * THREADS),
+                View::RawUav(16384), View::RawUav(16384), View::RawUav(super::MEMORY_FAULTS)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).expect("dispatch");
+        assert_eq!(out[3].len(), want.len());
+        let differences: Vec<_> = want.iter().zip(&out[3]).enumerate()
+            .filter(|(_, (expected, actual))| expected != actual).take(8).collect();
+        assert!(differences.is_empty(), "fault bitmap differences: {differences:?}");
+        eprintln!("verified all fault bitmap words on {}", if warp { "WARP" } else { "hardware" });
+    }
+}
 
 #[test]
 fn the_64_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {

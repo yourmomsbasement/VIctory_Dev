@@ -41,16 +41,17 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
 ///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
 ///   reads zeros and drops writes;
-/// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
-///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
-///   host reads afterwards to make those copies for the frames to come.
+/// - the root UAV `u<SLOT_FAULTS>` records missing pages in a bitmap. Its
+///   prefix has one summary bit per bitmap word, for sparse host reads.
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
-pub const MEMORY_FAULTS: u32 = 4096;
+pub const MEMORY_FAULTS: u32 = MEMORY_FAULT_SUMMARY + MEMORY_PAGES.div_ceil(32);
+/// Prefix of the fault buffer, in dwords. Both levels are set by GPU ORs.
+pub const MEMORY_FAULT_SUMMARY: u32 = MEMORY_PAGES.div_ceil(32 * 32);
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
