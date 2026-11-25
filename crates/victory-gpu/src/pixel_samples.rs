@@ -6,6 +6,8 @@
 //! hash:7d50:0,1@320,212 for a native instruction, two coordinate VGPRs
 //! and a pixel (or a row span such as 290-410,212). The record holds the multiply-accumulate operands or the
 //! UV, reference/LOD, sampled red channel and nearest clamped mip-zero texel.
+//! VICTORY_TRACE_COMPUTE_FRAMES=first-last saves just these compute probes
+//! throughout an inclusive frame range without enabling full command traces.
 use crate::host::{HostList, host, transition};
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
@@ -183,6 +185,15 @@ struct Draw {
 #[derive(Default)]
 pub(crate) struct Samples(Mutex<Vec<Draw>>);
 
+fn compute_frame(frame: u64) -> bool {
+    static RANGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    RANGE.get_or_init(|| {
+        let spec = std::env::var("VICTORY_TRACE_COMPUTE_FRAMES").ok()?;
+        let (first, last) = spec.trim().split_once('-')?;
+        Some((first.parse().ok()?, last.parse().ok()?))
+    }).is_some_and(|(first, last)| (first..=last).contains(&frame))
+}
+
 impl Samples {
     pub(crate) fn bind(
         &self,
@@ -191,7 +202,8 @@ impl Samples {
         heap: Option<&crate::descriptor::Heap>,
         compute_shader: Option<&str>,
     ) -> Option<(u64, Option<u64>)> {
-        let save = crate::capture::listed(frame) && crate::capture::folder().is_some();
+        let save = crate::capture::folder().is_some() && (crate::capture::listed(frame)
+            || (compute_shader.is_some() && compute_frame(frame)));
         let mut draws = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if !save && let Some(draw) = draws.iter().find(|d| d.readback.is_none()) {
             // SAFETY: the list owns this zero-enable header through completion.
