@@ -1217,10 +1217,8 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     let whole =
         *WHOLE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "1"));
     let r = resource(this);
-    // A level count of 0 asks for a full chain: not counted here.
     let one = |d: &ResourceDesc| {
         d.dimension != BUFFER
-            && d.mip_levels >= 1
             && d.depth_or_array_size >= 1
             && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
             && d.sample_count <= 1
@@ -1785,7 +1783,7 @@ fn resource<'a>(this: This) -> &'a Resource {
 // The creation methods' own arguments, passed on.
 #[allow(clippy::too_many_arguments)]
 fn hand_out_resource(
-    desc: ResourceDesc,
+    mut desc: ResourceDesc,
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
@@ -1796,6 +1794,11 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    // GetDesc and alias matching both describe the allocated texture.
+    // A zero at creation asks for the full chain.
+    if desc.dimension != BUFFER && desc.mip_levels == 0 {
+        desc.mip_levels = mip_count(&desc) as u16;
+    }
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -2346,6 +2349,31 @@ mod tests {
     }
 
     #[test]
+    fn resource_descriptions_report_the_allocated_mip_chain() {
+        let null = std::ptr::null();
+        let array = ResourceDesc { depth_or_array_size: 16, ..texture(7, 3, 28, 0) };
+        let volume = ResourceDesc { dimension: TEXTURE_3D, ..array };
+        for (desc, expected) in [
+            (texture(1, 1, 28, 0), 1),
+            (texture(8, 5, 28, 0), 4),
+            (array, 3),
+            (volume, 5),
+            (texture(8, 5, 28, 2), 2),
+            (buffer(4096), 1),
+        ] {
+            let mut image = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image),
+                S_OK
+            );
+            let mut actual = desc;
+            slot::<extern "system" fn(This, *mut ResourceDesc)>(image, 0x50)(image, &mut actual);
+            assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+            assert_eq!(actual.mip_levels, expected, "{desc:?}");
+        }
+    }
+
+    #[test]
     fn heaps_are_zeroed_aligned_memory() {
         let heap = heap(1 << 20);
         // SAFETY: a heap we just made.
@@ -2521,8 +2549,8 @@ mod tests {
         assert_eq!(t, u64::MAX, "no second subresource");
     }
 
-    /// A 4x4 texture filled from a title buffer through our list and queue,
-    /// then read back from the host GPU.
+    /// Fill the 4x4 mip of an 8x8 automatic chain through our list and
+    /// queue and read it back from the host GPU.
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
@@ -2534,7 +2562,7 @@ mod tests {
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
         let (mut image, mut source) = (null, null);
-        let rgba = texture(4, 4, 28, 1);
+        let rgba = texture(8, 8, 28, 0);
         assert_eq!(
             create_committed(
                 null,
@@ -2618,7 +2646,8 @@ mod tests {
         let to = Location {
             resource: image,
             kind: 0,
-            footprint: PlacedFootprint { offset: 0, ..rows },
+            // With kind 0 the first word of the union is the subresource index.
+            footprint: PlacedFootprint { offset: 1, ..rows },
         };
         let from = Location {
             resource: source,
