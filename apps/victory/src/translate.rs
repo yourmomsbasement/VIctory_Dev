@@ -170,7 +170,11 @@ pub fn run(
         );
     }
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        if let Some((min, max)) = host.wave_lanes() {
+            emit::set_host_max_wave(max);
+            println!("wave lanes   {min}..{max}");
+        }
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()

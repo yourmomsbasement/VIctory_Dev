@@ -63,6 +63,19 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
+    pub fn wave_lanes(&self) -> Option<(u32, u32)> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the output structure and its byte size match OPTIONS1.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            ).ok()?;
+        }
+        Some((options.WaveLaneCountMin, options.WaveLaneCountMax))
+    }
+
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
