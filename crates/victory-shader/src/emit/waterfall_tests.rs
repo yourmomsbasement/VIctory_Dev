@@ -212,8 +212,8 @@ fn host_shader(lowered: lower::Lowered) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        static_samplers: lowered.samplers.iter().copied().map(super::StaticSampler::from_words).collect(),
         samplers: lowered.samplers,
-        static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
@@ -226,6 +226,94 @@ fn host_shader(lowered: lower::Lowered) -> HostShader {
         eprintln!("no dxil.dll; validation skipped");
     }
     shader
+}
+
+/// Gather four red values into a raw UAV from a mipmapped SRV. One lane
+/// runs the same named-level GFX10 instructions used for meshlet occlusion.
+#[test]
+fn named_mip_gathers_preserve_tap_order_offsets_and_sampler_edges() {
+    let mut texels = vec![[99.0; 4]; 16]; // level 0 is deliberately distinct
+    texels.extend([1.0, 2.0, 3.0, 4.0, 9.0].map(|v| [v; 4])); // 2x2 then 1x1
+    let views = [View::TextureMips(4, 4, 3, &texels), View::RawUav(4)];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (warp, label) in [(false, "hardware"), (true, "WARP")] {
+        let Ok(host) = Host::new(warp) else { continue };
+        // Runtime sampler deliberately gives the border a color no texel holds.
+        let samplers = [D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_BORDER, AddressV: D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_BORDER, BorderColor: [17.; 4],
+            MaxLOD: 12., MaxAnisotropy: 1, ..Default::default()
+        }];
+        for (mode, offset, uv, lod, expected) in [
+            (Some(6), None, 0.25, 1., [3., 4., 2., 1.]),
+            (Some(6), Some(0x3f), 0.25, 1., [0., 3., 1., 0.]), // (-1, 0), black border
+            (Some(6), Some(2), 0.25, 1., [0., 0., 0., 0.]),
+            (None, Some(0x3f), 0.25, 1., [17., 3., 1., 17.]),
+            (None, Some(0x200), 0.25, 1., [17.; 4]), // (0, 2)
+            (Some(0), Some(2), 0.25, 1., [3., 4., 2., 1.]), // wrap
+            (Some(2), Some(2), 0.25, 1., [4., 4., 2., 2.]), // clamp
+            (Some(1), Some(2), 0.25, 1., [4., 3., 1., 2.]), // mirror
+            (Some(6), None, 0.25 - 0.00001, 1., [3., 4., 2., 1.]), // subtexel precision
+            (Some(2), None, 0.5, 12., [9.; 4]), // beyond the last mip
+        ] {
+            let shader = gather_program(mode, offset, uv, lod);
+            let (root, pso) = host.compute_pipeline(&shader).expect("gather pipeline");
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                views: &views, samplers: &samplers, groups: [1, 1, 1],
+            }).expect("gather dispatch");
+            let taps: Vec<_> = out[0].iter().copied().map(f32::from_bits).collect();
+            assert_eq!(taps, expected, "{label} mode={mode:?} offset={offset:?} uv={uv} lod={lod}");
+        }
+        eprintln!("validated named-mip gather taps on {label}");
+    }
+}
+
+fn gather_program(mode: Option<u32>, offset: Option<u32>, uv: f32, lod: f32) -> HostShader {
+    let mut words = vec![
+        0xbe84_0300, 0xbe85_0380, // view table from s0 to s[4:5]
+        0xf40c_0302, 0xfa00_0000, // texture in s[12:19]
+        0xf408_0602, 0xfa00_0020, // UAV in s[24:27]
+    ];
+    if let Some(mode) = mode {
+        words.extend([
+            0xbe88_03ff, mode | mode << 3 | mode << 6,
+            0xbe89_03ff, 0x00c0_0000, // sampler LOD 0..12
+            0xbe8a_03ff, 0x1850_0000, // linear filtering
+            0xbe8b_0380, // transparent black
+        ]);
+    } else {
+        // Sampler table at s1. Heap index 0 is its first descriptor.
+        words.extend([0xbe86_0301, 0xbe87_0380, 0xf408_0203, 0xfa00_0000]);
+    }
+    words.extend([
+        0x7e04_02ff, offset.unwrap_or(0),
+        0x7e06_02ff, uv.to_bits(), 0x7e08_02ff, uv.to_bits(), 0x7e0a_02ff, lod.to_bits(),
+        if offset.is_some() { 0xf150_0108 } else { 0xf110_0108 },
+        if offset.is_some() { 0x0043_0802 } else { 0x0043_0803 },
+        0xe078_0000, 0x8006_0800, // buffer_store_dwordx4 v[8:11]
+        0xbf81_0000,
+    ]);
+    let view = |kind, table_offset_dwords, dwords| UsedResource {
+        kind, root: RootType::Table, table_offset_dwords, lower_bound: 0,
+        stride: 0, dwords, user_data: 0, slot: 0,
+    };
+    let mut used = vec![view(ResourceType::Srv, 0, 8), view(ResourceType::Uav, 8, 4)];
+    if mode.is_none() {
+        used.push(UsedResource { slot: 1, user_data: 1, ..view(ResourceType::Sampler, 0, 4) });
+    }
+    let table = |slot| RootParam {
+        root: RootType::Table, table_offset_dwords: 0, sgprs: 1,
+        base_register: 0, user_data: slot, slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs, wave64: false, vgprs: 16,
+        layout: vec![table(0), table(1)], used,
+        io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [1; 3] }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    host_shader(lower_native(&native))
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the

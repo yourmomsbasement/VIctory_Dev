@@ -9347,6 +9347,63 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
+    /// Texel centers for a 2D gather with an explicit LOD. The title's depth
+    /// pyramid uses this with offsets (0,0), (2,0), (0,2), (2,2).
+    /// Sampling each center lets the sampler apply its U/V and border modes.
+    fn gather_2d_footprint(
+        &mut self,
+        texture: V,
+        mut lod: V,
+        uv: [V; 2],
+        offset: [V; 2],
+        sampler: Option<super::StaticSampler>,
+    ) -> (V, [(V, V); 4]) {
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let zero = self.s.m.f32(0);
+        let one = self.s.m.f32(1.0f32.to_bits());
+        if let Some(sampler) = sampler {
+            let min = self.s.m.f32(sampler.min_lod.to_bits());
+            let max = self.s.m.f32(sampler.max_lod.to_bits());
+            lod = self.binary(35, lod, min);
+            lod = self.binary(36, lod, max);
+        }
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let level0 = self.s.m.i32(0);
+        let base = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[texture, level0]);
+        let levels = self.s.m.extract(c, base, 3);
+        let levels = self.s.m.cast(c, Cast::UiToFp, levels, f32t);
+        let last = self.s.m.bin(c, Bin::Sub, levels, one);
+        let last = self.binary(35, last, zero);
+        lod = self.binary(35, lod, zero);
+        lod = self.binary(36, lod, last);
+        let lod = self.unary(26, lod); // round to nearest
+        let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
+        let size = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[texture, mip]);
+        let half = self.s.m.f32(0.5f32.to_bits());
+        let subtexels = self.s.m.f32(256.0f32.to_bits());
+        let fraction = self.s.m.f32((1.0f32 / 256.0).to_bits());
+        let mut centers = [[zero; 2]; 2];
+        for axis in 0..2 {
+            let n = self.s.m.extract(c, size, axis as u32);
+            let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+            let x = self.s.m.bin(c, Bin::Mul, uv[axis], n);
+            let x = self.s.m.bin(c, Bin::Sub, x, half);
+            // The sampler snaps to subtexel precision before selecting neighbors.
+            let x = self.s.m.bin(c, Bin::Mul, x, subtexels);
+            let x = self.unary(26, x);
+            let x = self.s.m.bin(c, Bin::Mul, x, fraction);
+            let first = self.unary(27, x); // floor
+            let by = self.s.m.cast(c, Cast::SiToFp, offset[axis], f32t);
+            let first = self.s.m.bin(c, Bin::Add, first, by);
+            let low = self.s.m.bin(c, Bin::Add, first, half);
+            let high = self.s.m.bin(c, Bin::Add, low, one);
+            centers[axis] = [low, high].map(|x| self.s.m.bin(c, Bin::SDiv, x, n));
+        }
+        let [[u0, u1], [v0, v1]] = centers;
+        (lod, [(u0, v1), (u1, v1), (u1, v0), (u0, v0)])
+    }
+
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
@@ -9650,7 +9707,30 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let spatial = coords - usize::from(kind == 6 || kind == 7);
+            let named_gather = matches!(name, "image_gather4_l" | "image_gather4_l_o")
+                && coords == 2 && spatial == 2;
+            let immediate: Option<[u32; 4]> = match ss {
+                Source::Constant(words) if named_gather => {
+                    words.get(..4).and_then(|w| w.try_into().ok())
+                }
+                _ => None,
+            };
+            // Each tap is a single texel. Keep the immediate sampler's address
+            // and border modes; the gather below chooses its mip explicitly.
+            let point = immediate.map(|mut w| {
+                w[0] &= !(3 << 29); // ordinary filtering
+                w[1] = 0x00ff_f000; // full LOD range
+                // Point min/mag, nearest mip, no LOD bias.
+                w[2] = (w[2] & !((0xf << 20) | (3 << 26) | 0x3fff)) | (1 << 26);
+                Source::Constant(w.to_vec())
+            });
+            let sh = self.handle(
+                site,
+                point.as_ref().unwrap_or(ss),
+                true,
+                (14 | if cmp { 0x8000 } else { 0 }, 0),
+            )?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -9659,7 +9739,6 @@ impl<'a> Lower<'a> {
                 + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
-            let spatial = coords - usize::from(kind == 6 || kind == 7);
             // A cube's gradients are the two of its face coordinates.
             let grads = if kind == 5 { 2 } else { spatial };
             let deriv_regs = if op == 63 {
@@ -9950,70 +10029,24 @@ impl<'a> Lower<'a> {
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
                     }
-                    if matches!(name, "image_gather4_l" | "image_gather4_l_o")
-                        && coords == 2
-                        && spatial == 2
-                    {
-                        // The host's gather has no level: it read level 0
-                        // where the title names one (the depth pyramid its
-                        // occlusion tests read: most of the world was
-                        // culled against the wrong depths). The four texels
-                        // are read at the level instead, in the gather's
-                        // order: (u0,v1) (u1,v1) (u1,v0) (u0,v0).
-                        // With an offset too (`image_gather4_l_o`): the
-                        // offset is in texels of that level. Grand Theft
-                        // Auto VI's meshlet culling takes a 4x4 block of
-                        // the pyramid as one gather and three offset ones
-                        // ((2,0), (0,2), (2,2)); the three read level 0,
-                        // two texels beside the first one's place, so a
-                        // meshlet three or four texels wide was tested
-                        // against a quarter of what it covers.
-                        // shortcut: the level is rounded to a whole one and
-                        // coordinates past the edge are clamped, whatever
-                        // the sampler says.
+                    if named_gather {
                         let lod = addr_packed(self, coord_base, coords)?;
                         let lod = to_float(self, lod);
-                        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-                        let zero = self.s.m.f32(0);
-                        let lod = self.binary(35, lod, zero); // maximum
-                        let lod = self.unary(26, lod); // round to nearest
-                        let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
-                        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-                        let d = self
-                            .s
-                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-                        let half = self.s.m.f32(0.5f32.to_bits());
-                        let one = self.s.m.f32(1.0f32.to_bits());
-                        let (mut lo, mut hi) = ([iu; 2], [iu; 2]);
-                        for k in 0..2 {
-                            let n = self.s.m.extract(c, d, k as u32);
-                            let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
-                            let last = self.s.m.bin(c, Bin::Sub, n, one);
-                            let t = self.s.m.bin(c, Bin::Mul, cs[k], n);
-                            let t = self.s.m.bin(c, Bin::Sub, t, half);
-                            let first = self.unary(27, t); // round down
-                            // The offset word's field (0 without one).
-                            let by = self.s.m.cast(c, Cast::SiToFp, os[k], f32t);
-                            let first = self.s.m.bin(c, Bin::Add, first, by);
-                            let next = self.s.m.bin(c, Bin::Add, first, one);
-                            for (slot, x) in [(&mut lo[k], first), (&mut hi[k], next)] {
-                                let x = self.binary(35, x, zero); // maximum
-                                let x = self.binary(36, x, last); // minimum
-                                *slot = self.s.m.cast(c, Cast::FpToSi, x, i32t);
-                            }
-                        }
+                        let (lod, texels) = self.gather_2d_footprint(
+                            h, lod, [cs[0], cs[1]], [os[0], os[1]],
+                            immediate.map(super::StaticSampler::from_words),
+                        );
                         let ch = dmask.trailing_zeros();
                         let mut g = [fu; 4];
                         let mut read = None;
-                        let texels = [(lo[0], hi[1]), (hi[0], hi[1]), (hi[0], lo[1]), (lo[0], lo[1])];
                         for (slot, (x, y)) in g.iter_mut().zip(texels) {
                             let r = self.s.op(
                                 c,
-                                "textureLoad.f32",
+                                "sampleLevel.f32",
                                 Attr::ReadOnly,
                                 self.s.t.res_ret,
-                                66,
-                                &[h, mip, x, y, iu, iu, iu, iu],
+                                62,
+                                &[h, sh, x, y, fu, fu, zero, zero, iu, lod],
                             );
                             *slot = self.s.m.extract(c, r, ch);
                             read = Some(r);
